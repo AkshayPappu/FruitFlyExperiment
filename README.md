@@ -1,6 +1,6 @@
 ---
 title: Fruit Fly Simulation
-emoji: 🚀
+emoji: 🪰
 colorFrom: purple
 colorTo: purple
 sdk: static
