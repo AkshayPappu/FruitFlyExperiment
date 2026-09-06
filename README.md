@@ -8,6 +8,7 @@ app_file: dist/index.html
 pinned: false
 license: apache-2.0
 short_description: Simulate a fruit fly in your browser using WebGPU kernels
+thumbnail: https://cdn-uploads.huggingface.co/production/uploads/61b253b7ac5ecaae3d1efe0c/0V_xp6SNzo4Hovk1KH63I.png
 ---
 
 # Neural Canvas
