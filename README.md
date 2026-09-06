@@ -1,3 +1,15 @@
+---
+title: Fruit Fly Simulation
+emoji: 🪰
+colorFrom: purple
+colorTo: purple
+sdk: static
+app_file: dist/index.html
+pinned: false
+license: apache-2.0
+short_description: Simulate a fruit fly in your browser using WebGPU kernels
+---
+
 # Neural Canvas
 
 A standalone fruit fly connectome demo: paint neurons, stimulate the network, and watch an articulated Three.js fly respond. Vanilla JavaScript, Vite, Three.js, and `@huggingface/kernels`.
