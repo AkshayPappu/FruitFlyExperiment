@@ -1,0 +1,38 @@
+// Pass 2 of the split-K column-wise reduction. One invocation per output column
+// folds the segment partials and applies the selected reduction's final step.
+// Segments are folded in ascending order for deterministic results. This order
+// differs from the single-pass reduction but remains within the f32 tolerance.
+{% if source.outputF16 %}
+enable f16;
+{% endif %}
+{{ env.wgsl.resourceDeclarations }}
+/* Exact max/min reduction identities. WGSL rejects infinity during constant
+ * evaluation, so f32 identities are constructed at runtime from their
+ * IEEE-754 bit patterns. */
+
+
+const WG: u32 = {{ workgroupSize }}u;
+const SPLIT: u32 = {{ split }}u;
+
+@compute @workgroup_size(WG, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>,
+        @builtin(num_workgroups) nwg: vec3<u32>) {
+  let stride = nwg.x * WG;
+  let start = (gid.y * nwg.x * WG) + gid.x;
+  for (var col = start; col < params.cols; col = col + stride) {
+{% if source.intMode %}
+    var total = 0i;
+{% else %}
+    var total = 0.0;
+{% endif %}
+    for (var seg = 0u; seg < SPLIT; seg = seg + 1u) {
+      let p = partials[seg * params.cols + col];
+      total = total + p;
+    }
+{% if source.outputF16 %}
+    y[col] = f16(total);
+{% else %}
+    y[col] = total;
+{% endif %}
+  }
+}

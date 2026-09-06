@@ -1,0 +1,220 @@
+{
+  "title": "Neural Canvas",
+  "created": "2026-09-06",
+  "scope": "Official MaleCNS brain and nerve cord connectivity with an adapted spiking model. Computed neural activity drives crafted, illustrative movements; this is not a validated whole-fly emulation.",
+  "data": {
+    "dataset": "MaleCNS v1.0",
+    "neurons": 166700,
+    "directedEdges": 25582938,
+    "synapses": 124177617,
+    "paintableSomaPositions": 139662,
+    "selection": "All annotation rows with non-null superclass, induced graph without an additional edge threshold",
+    "source": "https://male-cns.janelia.org/download/",
+    "license": "CC BY 4.0",
+    "audit": "./data/manifest.json",
+    "identifiers": "bodyId is a unique dataset identifier, not a sequential neuron number; 166700 unique records, IDs10001\u20131471062202."
+  },
+  "neuralModel": {
+    "reference": "https://www.nature.com/articles/s41586-024-07763-9",
+    "dtMs": 0.1,
+    "membraneTauMs": 20,
+    "synapticTauMs": 5,
+    "thresholdMv": -45,
+    "restMv": -52,
+    "delayMs": 1.8,
+    "refractoryMs": 2.2,
+    "synapseWeightMv": 0.275,
+    "poissonVoltageMv": 68.75,
+    "seed": 1,
+    "signs": {
+      "acetylcholine": 1,
+      "gaba": -1,
+      "glutamate": -1,
+      "dopamine": 1,
+      "octopamine": 1,
+      "serotonin": 1,
+      "histamine": 0,
+      "unknown": 0
+    },
+    "omittedFastOutputNeurons": 11068,
+    "pulse": {
+      "initialHz": 180,
+      "holdMs": 80,
+      "decayTauMs": 180,
+      "maximumMs": 1000,
+      "rateFloorHz": 1,
+      "updateMs": 10,
+      "turnPreset": {
+        "holdMs": 650,
+        "decayTauMs": 220,
+        "maximumMs": 2500,
+        "replaceExternalInputs": true,
+        "preserveRecurrentState": true,
+        "directDescendingInput": true
+      },
+      "actionTargets": {
+        "walk": "Bilateral LC9",
+        "left": "Left LC9 and DNa02",
+        "right": "Right LC9 and DNa02",
+        "fly": "Bilateral LC4",
+        "turnRationale": "Direct ipsilateral DNa02 input keeps turn readout active when LC9 recruitment is weak; spikes still pass through the neural model and rate decoder."
+      }
+    }
+  },
+  "controller": {
+    "kind": "Crafted animation driven by computed firing rates; no direct brush or preset input",
+    "readouts": [
+      "DNp09/DNg100/DNg97 left and right",
+      "DNa02/DNa11/DNg13 left and right",
+      "MDN",
+      "DNp01"
+    ],
+    "filterMs": 80,
+    "units": "millimetres, seconds, radians",
+    "walkingGainMmS": 8,
+    "yawGainRadS": 3.8,
+    "jumpLaunchMmS": 80,
+    "gravityMmS2": 9810,
+    "movement": "Smoothed rate-to-speed and rate-to-yaw mapping, authored tripod foot trajectories, joint-limited IK, and a bounded flight/landing controller. No contact, muscle or aerodynamic simulation.",
+    "sensoryFeedback": "None; body motion does not feed back into the neural network.",
+    "escapeFlight": {
+      "triggerHz": 100,
+      "rearmHz": 45,
+      "minimumPoweredSeconds": 0.35,
+      "maximumPoweredSeconds": 0.9,
+      "quietBeforeLandingSeconds": 0.06,
+      "heightTargetMm": [
+        2.2,
+        3
+      ],
+      "speedTargetMmS": [
+        16,
+        24
+      ],
+      "altitudeOmega": 24,
+      "landingOmega": 16,
+      "maxSubstepSeconds": 0.002,
+      "contactThresholdMm": 0.025,
+      "postLandingCooldownSeconds": 0.2,
+      "wingDeploymentTauSeconds": 0.022,
+      "wingFoldingTauSeconds": 0.065,
+      "sequenceReference": "https://journals.biologists.com/jeb/article/211/3/341/18097/Performance-trade-offs-in-the-flight-initiation-of",
+      "scope": "Authored bounded flight controller triggered by computed DNp01 rates. Numerical movement gains are illustrative, not fitted physiology."
+    }
+  },
+  "body": {
+    "source": "https://github.com/NeLy-EPFL/fly-svg-maker/tree/152506d3471646f009480c81f34aefbaec29a6e5",
+    "description": "Official NeuroMechFly micro-CT-derived female specimen meshes and kinematic tree used to visualize the male-connectome experiment",
+    "segments": 69,
+    "uniqueMeshes": 39,
+    "meshLicense": "Apache-2.0",
+    "kinematicCodeLicense": "MIT",
+    "wings": {
+      "foldedDegrees": {
+        "pitch": 30,
+        "leftRoll": 0,
+        "rightRoll": 0,
+        "leftYaw": 5,
+        "rightYaw": -5
+      },
+      "extendedDegrees": {
+        "pitch": 10,
+        "leftRoll": -75,
+        "rightRoll": 75,
+        "leftYaw": 20,
+        "rightYaw": -20
+      },
+      "flapAmplitudeDegrees": 35,
+      "flapStartsAboveExtension": 0.7,
+      "wingbeatHz": 277,
+      "temporalExposures": 3,
+      "hinges": "Original measured positions, unchanged",
+      "clock": "Interpolated neural time; no animation progress beyond computed simulation time"
+    },
+    "gaitPosture": {
+      "method": "Damped Jacobian null-space posture correction around standing pose calibrated once from measured skeleton; foot targets and measured joint limits preserved",
+      "timeConstantMs": 120,
+      "maximumElapsedMs": 50,
+      "settledJointToleranceRad": 0.001,
+      "skipJacobianWhenFootAndPostureConverged": true
+    }
+  },
+  "compute": {
+    "runtime": "@huggingface/kernels 0.0.1-preview.1, pinned npm dependency",
+    "sparseOperator": "Outgoing CSR with 19 sparse delayed spike queues, indirect four-source workgroups and fused integration/event/reset on the kernel runtime GPUDevice",
+    "deviceBridge": "Pinned and guarded tensor.runtime.host.device implementation interface",
+    "decoder": "Official MatMul on 18 gathered resident motor-neuron counts (6x18); single readback fence for full counts and motor rates; all six outputs compared to JavaScript each batch",
+    "kernels": {
+      "Identity": "88a09b2fc38107f00e33af195ca4507df772967e",
+      "MatMul": "16a3da1933ef99f9daf823f87569cd12b6429d66"
+    },
+    "fallback": "JavaScript reference; runtime GPU failure restarts from reset state"
+  },
+  "limitations": [
+    "Model transfer from female brain research to male CNS is unvalidated.",
+    "Unknown/histamine fast signaling, intrinsic heterogeneity, receptor-specific dynamics, gap junctions and neuromodulation omitted.",
+    "Some pulses lead to sustained recurrent activity even after the input and body motion settle.",
+    "Body mesh comes from a female specimen. Movement gains, activation thresholds, pulse envelopes, gait and flight are authored for the demo, not fitted or validated against animal behavior.",
+    "Computed spikes drive an illustrative controller rather than individual muscles. Ground contact, aerodynamics and body-to-neural sensory feedback are omitted."
+  ],
+  "rendering": {
+    "interface": "Reference split layout with responsive toolbars and a single enlarged fly canvas beneath title, transport/camera controls and specimen/scale overlays",
+    "surfaceDetail": "Authored compound-eye facets, cuticle variation, illustrative wing veins and 319 attached bristles; source scan geometry and hinges unchanged",
+    "depthOfField": {
+      "method": "One scene render, beauty depth texture, alpha-preserving BokehShader and MacroOutputPass (always enabled)",
+      "focus": "Head centre in camera-space depth",
+      "aperture": 0.0012,
+      "maximumBlur": 0.004,
+      "transparentWingDepthWrite": false,
+      "optional": true
+    },
+    "maximumPixelRatio": 1.5,
+    "maximumRenderPixels": 1200000,
+    "camera": {
+      "fieldOfViewDegrees": 30,
+      "sideOffsetMm": [
+        3.2,
+        -5.7,
+        1.9
+      ],
+      "bodyTargetMm": [
+        -0.4,
+        0,
+        0.68
+      ],
+      "flightDistanceMultiplier": 1.5,
+      "following": "Side has a fixed world viewing angle with full position tracking; Top fixed overhead; Follow rear three-quarter chase camera with 160 ms neural-time heading smoothing. Manual orbit releases heading tracking.",
+      "followOffsetMm": [
+        -5.5,
+        -4.8,
+        2.8
+      ],
+      "overlayFraming": "Vertical projection offset centers camera target between header/camera and specimen overlays"
+    },
+    "fontLicense": "SIL Open Font License 1.1",
+    "brainView": {
+      "rotationAboutXDegrees": 25,
+      "cameraBounds": "0.01%\u201399.99% projected coordinate quantiles; framing only, membership unchanged",
+      "members": 124296,
+      "visibleAt920By460": 124295,
+      "projection": "Rigid orthographic view with uniform scale; all official positions and hit tests retained"
+    },
+    "backdrop": {
+      "edgeSRGB": "#10171d",
+      "centerSRGB": "#202a35",
+      "composite": "Unpremultiply linear scene before tone mapping; composite against encoded gradient after color-space transform",
+      "groundFade": "Camera-space depth; start=max(9 mm,camera target distance+2 mm), end=start+15 mm"
+    },
+    "icons": "Official Lucide paintbrush, eraser and footprints; bundled ISC/MIT license notices",
+    "setup": {
+      "initial": "Blocking native modal with Download & start; no anatomy or weight download before explicit action",
+      "ready": "Unlock painting only after anatomy, fly meshes and compute initialization finish",
+      "recovery": "Progress, checked cached weight reuse, asset/worker retry and automatic CPU fallback",
+      "labels": {
+        "presets": "Actions",
+        "escapeAction": "Fly",
+        "escapeReadout": "Escape drive"
+      }
+    }
+  }
+}

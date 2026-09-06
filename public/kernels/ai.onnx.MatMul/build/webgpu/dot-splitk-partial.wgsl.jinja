@@ -1,0 +1,79 @@
+{% macro wgsl_tree_fold_stmt(a, op, idx, svar) %}
+{% if op == "max" %}
+{{ a }}[{{ idx }}] = max({{ a }}[{{ idx }}], {{ a }}[{{ idx }} + {{ svar }}]);
+{%- else %}
+{{ a }}[{{ idx }}] = {{ a }}[{{ idx }}] + {{ a }}[{{ idx }} + {{ svar }}];
+{%- endif %}
+{% endmacro %}
+{% macro wgsl_tree_fold(arrays, op="add", idx="lid", wg="WORKGROUP_SIZE", svar="stride", typed=false, form="tail", breakInline=false, bodyInline=false, barrierFirst=false) %}
+  var {{ svar }}{{ ": u32 " if typed else " " }}= {{ wg }} / 2u;
+  loop {
+{% if form == "head" %}
+{% if breakInline %}
+    if ({{ svar }} == 0u) { break; }
+{% else %}
+    if ({{ svar }} == 0u) {
+      break;
+    }
+{% endif %}
+{% endif %}
+{% if bodyInline %}
+    if ({{ idx }} < {{ svar }}) { {{ wgsl_tree_fold_stmt(arrays[0], op, idx, svar) }} }
+{% else %}
+    if ({{ idx }} < {{ svar }}) {
+{% for a in arrays %}
+      {{ wgsl_tree_fold_stmt(a, op, idx, svar) }}
+{% endfor %}
+    }
+{% endif %}
+{% if form == "head" %}
+{% if barrierFirst %}
+    workgroupBarrier();
+    {{ svar }} = {{ svar }} / 2u;
+{% else %}
+    {{ svar }} = {{ svar }} / 2u;
+    workgroupBarrier();
+{% endif %}
+{% else %}
+    workgroupBarrier();
+    if ({{ svar }} == 1u) {
+      break;
+    }
+    {{ svar }} = {{ svar }} / 2u;
+{% endif %}
+  }
+{%- endmacro %}
+
+/* Split-K parallel dot product (1D·1D MatMul to scalar). The scalar route
+   serializes the K reduction in one invocation. This grid-parallel route has
+   SPLIT workgroups traverse the vec4 views of a and b, accumulate in registers,
+   reduce within each workgroup, and write one partial each. A following combine
+   pass folds those partials into c[0]. f16 inputs widen before the dot, so
+   accumulation remains f32. */
+{% if source.usesF16 %}
+enable f16;
+{% endif %}
+{{ env.wgsl.resourceDeclarations }}
+
+const WG: u32 = {{ workgroupSize }}u;
+var<workgroup> red: array<f32, WG>;
+
+@compute @workgroup_size(WG)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wg: vec3<u32>,
+        @builtin(num_workgroups) nwg: vec3<u32>) {
+  let tid = lid.x;
+  let gstride = nwg.x * WG;
+  var acc = 0.0;
+  // Grid-stride over the flat vec4 view; dot() does the 4-wide MAC per step.
+  for (var i = gid.x; i < params.count4; i = i + gstride) {
+    acc = acc + dot(vec4<f32>(a[i]), vec4<f32>(b[i]));
+  }
+  red[tid] = acc;
+  workgroupBarrier();
+{{ wgsl_tree_fold(["red"], idx="tid", wg="WG", typed=true, form="head", breakInline=true) }}
+  if (tid == 0u) {
+    partials[wg.x] = red[0];
+  }
+}

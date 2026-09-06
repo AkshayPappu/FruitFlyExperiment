@@ -1,0 +1,24 @@
+{% if T == "f16" %}
+enable f16;
+{% endif %}
+{{ env.wgsl.resourceDeclarations }}
+
+@compute @workgroup_size(1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  if (gid.x != 0u) {
+    return;
+  }
+{% if T == "i32" or T == "u32" %}
+  var acc = {{ T }}(0);
+  for (var k = 0u; k < params.K; k = k + 1u) {
+    acc = acc + a[k] * b[k];
+  }
+  y[0] = acc;
+{% else %}
+  var acc = 0.0;
+  for (var k = 0u; k < params.K; k = k + 1u) {
+    acc = acc + f32(a[k]) * f32(b[k]);
+  }
+  y[0] = {{ T }}(acc);
+{% endif %}
+}

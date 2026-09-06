@@ -1,0 +1,40 @@
+{% if T == "f16" %}
+enable f16;
+{% endif %}
+{{ env.wgsl.resourceDeclarations }}
+
+// Rank-1 × rank-2 and rank-2 × rank-1 fallbacks share the same folded output
+// traversal. vectorOnLeft selects only the contiguous-storage address formula.
+@compute @workgroup_size({{ fallbackTile }}, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>,
+        @builtin(num_workgroups) nwg: vec3<u32>) {
+  let output_index = gid.x + gid.y * nwg.x * {{ fallbackTile }}u;
+  if (output_index >= params.{{ "N" if vectorOnLeft else "M" }}) {
+    return;
+  }
+{% if T == "i32" or T == "u32" %}
+  var acc = {{ T }}(0);
+{% else %}
+  var acc = 0.0;
+{% endif %}
+  for (var k = 0u; k < params.K; k += 1u) {
+{% if vectorOnLeft %}
+{% if T == "i32" or T == "u32" %}
+    acc += a[k] * b[k * params.N + output_index];
+{% else %}
+    acc += f32(a[k]) * f32(b[k * params.N + output_index]);
+{% endif %}
+{% else %}
+{% if T == "i32" or T == "u32" %}
+    acc += a[output_index * params.K + k] * b[k];
+{% else %}
+    acc += f32(a[output_index * params.K + k]) * f32(b[k]);
+{% endif %}
+{% endif %}
+  }
+{% if T == "i32" or T == "u32" %}
+  y[output_index] = acc;
+{% else %}
+  y[output_index] = {{ T }}(acc);
+{% endif %}
+}

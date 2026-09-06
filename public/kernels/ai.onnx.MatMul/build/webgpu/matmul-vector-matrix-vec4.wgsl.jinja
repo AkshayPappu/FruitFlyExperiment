@@ -1,0 +1,56 @@
+// GEMV specialization for y[N] = a[K] @ B[K, N]: each workgroup owns 32
+// consecutive vec4 column groups (128 output columns). Shared by MatMul and
+// matrix-shaped Einsum decode projections.
+{% if usesF16 %}
+enable f16;
+
+{% endif %}
+{{ env.wgsl.resourceDeclarations }}
+{% set OUT = outputBuffer if outputBuffer is defined else "c" %}
+
+const LANES: u32 = 32u;
+// SLICES is chosen from the workgroup COUNT, not from a fixed default: this
+// kernel launches ceilDiv(N, 128) workgroups, so a narrow-N projection starves
+// the device unless each workgroup carries more of the K reduction.
+const SLICES: u32 = {{ gemvSlices }}u;
+
+var<workgroup> partials: array<vec4<f32>, LANES * SLICES>;
+
+@compute @workgroup_size(32, {{ gemvSlices }}, 1)
+fn main(
+  @builtin(workgroup_id) workgroup_id: vec3<u32>,
+  @builtin(local_invocation_id) lid: vec3<u32>
+) {
+  let lane = lid.x;
+  let slice = lid.y;
+  let cg = workgroup_id.x * LANES + lane;
+  var acc = vec4<f32>(0.0);
+  if (cg < params.N4) {
+{% if unrollK2 is defined and unrollK2 %}
+    // Two K positions per iteration amortize loop/address arithmetic on long
+    // decode projections while preserving each slice's exact strided order.
+    var k = slice;
+    for (; k + SLICES < params.K; k = k + 2u * SLICES) {
+      acc = acc + f32(a[k]) * vec4<f32>(b[k * params.N4 + cg]);
+      let k1 = k + SLICES;
+      acc = acc + f32(a[k1]) * vec4<f32>(b[k1 * params.N4 + cg]);
+    }
+    if (k < params.K) {
+      acc = acc + f32(a[k]) * vec4<f32>(b[k * params.N4 + cg]);
+    }
+{% else %}
+    for (var k = slice; k < params.K; k = k + SLICES) {
+      acc = acc + f32(a[k]) * vec4<f32>(b[k * params.N4 + cg]);
+    }
+{% endif %}
+  }
+  partials[slice * LANES + lane] = acc;
+  workgroupBarrier();
+  if (slice == 0u && cg < params.N4) {
+    var total = partials[lane];
+    for (var s = 1u; s < SLICES; s = s + 1u) {
+      total = total + partials[s * LANES + lane];
+    }
+    {{ OUT }}[cg] = vec4<{{ T }}>(total);
+  }
+}

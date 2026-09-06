@@ -1,0 +1,54 @@
+{% if T == "f16" %}
+enable f16;
+{% endif %}
+{{ env.wgsl.resourceDeclarations }}
+{% set OUT = outputBuffer %}
+
+// Scalar-storage tail kernels for y[N] = a[K] @ B[K,N]. Keeping B scalar
+// preserves the true odd-N row stride. The f32 path computes four adjacent
+// output columns per invocation to amortize addressing; the f16 path uses one
+// accumulator to limit register pressure. Both use the same folded dispatch.
+@compute @workgroup_size(64, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>,
+        @builtin(num_workgroups) nwg: vec3<u32>) {
+{% if T == "f16" %}
+  let col = gid.x + gid.y * nwg.x * 64u;
+  if (col >= params.N) { return; }
+  var acc = 0.0;
+  for (var k = 0u; k < params.K; k = k + 1u) {
+    acc = acc + f32(a[k]) * f32(b[k * params.N + col]);
+  }
+  {{ OUT }}[col] = f16(acc);
+{% else %}
+  let col4 = gid.x + gid.y * nwg.x * 64u;
+  let col = col4 * 4u;
+  if (col >= params.N) { return; }
+
+  var acc = vec4<f32>(0.0);
+  if (col + 3u < params.N) {
+    for (var k = 0u; k < params.K; k = k + 1u) {
+      let row = k * params.N + col;
+      let bv = vec4<f32>(f32(b[row]), f32(b[row + 1u]), f32(b[row + 2u]), f32(b[row + 3u]));
+      acc = acc + vec4<f32>(f32(a[k])) * bv;
+    }
+    {{ OUT }}[col] = {{ T }}(acc.x);
+    {{ OUT }}[col + 1u] = {{ T }}(acc.y);
+    {{ OUT }}[col + 2u] = {{ T }}(acc.z);
+    {{ OUT }}[col + 3u] = {{ T }}(acc.w);
+    return;
+  }
+
+  // One partial group per row at most; all components remain bounds-safe for
+  // N % 4 = 1, 2, or 3 without padding or a preprocessing pass.
+  for (var k = 0u; k < params.K; k = k + 1u) {
+    let row = k * params.N + col;
+    let av = f32(a[k]);
+    acc.x = acc.x + av * f32(b[row]);
+    if (col + 1u < params.N) { acc.y = acc.y + av * f32(b[row + 1u]); }
+    if (col + 2u < params.N) { acc.z = acc.z + av * f32(b[row + 2u]); }
+  }
+  {{ OUT }}[col] = {{ T }}(acc.x);
+  if (col + 1u < params.N) { {{ OUT }}[col + 1u] = {{ T }}(acc.y); }
+  if (col + 2u < params.N) { {{ OUT }}[col + 2u] = {{ T }}(acc.z); }
+{% endif %}
+}

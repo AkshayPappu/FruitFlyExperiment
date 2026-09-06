@@ -1,0 +1,91 @@
+{
+  "domain": "ai.onnx",
+  "name": "Identity",
+  "sinceVersion": 16,
+  "description": "Copies the input tensor to the output unchanged. The output has the same shape, dtype, and values as the input.",
+  "inputs": [{ "role": "input", "dtype": "T", "description": "Input tensor to be copied." }],
+  "outputs": [
+    {
+      "role": "output",
+      "dtype": "T",
+      "rank": "ranks.input",
+      "description": "Output tensor; an exact copy of the input.",
+      "shape": "shapes.input"
+    }
+  ],
+  "typeConstraints": { "T": ["float32", "float16", "uint32", "int32", "int16", "uint8", "int8", "bool"] },
+  "args": {
+    "x": { "kind": "tensor", "semantic": "input", "role": "input" },
+    "y": { "kind": "tensor", "semantic": "output", "role": "output" }
+  },
+  "tunables": { "WORKGROUP_SIZE": 256 },
+  "constants": { "usesF16": "dtypes.T == \"f16\"" },
+  "variants": [
+    {
+      "id": "copy_vec4",
+      "priority": 20,
+      "when": ["numel(shapes.input) > 0", "numel(shapes.input) % 4 == 0", "numel(shapes.input) == numel(shapes.output)", "f16Ok(dtypes.T)"],
+      "constants": { "vectorScalar": "\"vec4<\" ~ dtypes.T ~ \">\"", "COPY_VEC4_LEN": "numel(shapes.output) / 4" },
+      "passes": [
+        {
+          "id": "main",
+          "name": "Identity.copyVec4",
+          "source": { "shader": "datamove-flat-copy.wgsl.jinja", "inputs": { "count": "numel(shapes.output) / 4" } },
+          "bindings": [
+            {
+              "name": "src",
+              "arg": "x",
+              "semantic": "input",
+              "buffer": { "type": "read-only-storage" },
+              "elementType": "$vectorScalar",
+              "length": "$COPY_VEC4_LEN"
+            },
+            {
+              "name": "dst",
+              "arg": "y",
+              "semantic": "output",
+              "buffer": { "type": "storage" },
+              "elementType": "$vectorScalar",
+              "length": "$COPY_VEC4_LEN"
+            }
+          ],
+          "dispatch": { "gridStride": "numel(shapes.output) / 4", "workgroupSize": "tunables.WORKGROUP_SIZE" },
+          "viewAlias": [{ "input": "src", "output": "dst" }]
+        }
+      ]
+    },
+    {
+      "id": "copy",
+      "when": "numel(shapes.input) == numel(shapes.output) and (f16Ok(dtypes.T))",
+      "constants": { "scalar": "dtypes.T" },
+      "passes": [
+        {
+          "id": "main",
+          "name": "Identity",
+          "shader": "datamove-elementwise-copy.wgsl.jinja",
+          "bindings": [
+            {
+              "name": "x",
+              "arg": "x",
+              "semantic": "input",
+              "buffer": { "type": "read-only-storage" },
+              "elementType": "$scalar"
+            },
+            { "name": "y", "arg": "y", "semantic": "output", "buffer": { "type": "storage" }, "elementType": "$scalar" },
+            {
+              "name": "params",
+              "semantic": "kernel.params",
+              "buffer": { "type": "uniform" },
+              "struct": {
+                "name": "Params",
+                "fields": [{ "name": "count", "type": "u32", "value": "numel(shapes.output)" }]
+              }
+            }
+          ],
+          "dispatch": { "gridStride": "numel(shapes.output)", "workgroupSize": "tunables.WORKGROUP_SIZE" },
+          "viewAlias": [{ "input": "x", "output": "y" }]
+        }
+      ]
+    }
+  ]
+}

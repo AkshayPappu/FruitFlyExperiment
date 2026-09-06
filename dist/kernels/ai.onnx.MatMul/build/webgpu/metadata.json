@@ -1,0 +1,31 @@
+{
+  "name": "ai.onnx.MatMul",
+  "id": "_ai_onnx_matmul_webgpu_06e7e6a",
+  "version": 1,
+  "license": "Apache-2.0",
+  "backend": { "type": "webgpu" },
+  "digest": {
+    "algorithm": "sha256",
+    "files": {
+      "bench.json": "YliEK5kWigxWwBD0A5ny/MIDXKMU/0z7qvqI63UVIV8=",
+      "dot-splitk-partial.wgsl.jinja": "w4l/QFoz8IZmMPfNtIhgatjoEXH1Tjyee6939GjUn8o=",
+      "manifest.json": "/ndTej4huJBSIs6kYYqOSAhB8/iNb/uVWqn3pl5UAKU=",
+      "matmul-batched-vector.wgsl.jinja": "mtg1v8fAnwU+newDDiCRSjlzBO49SDCBsa/3r86AO2I=",
+      "matmul-batched.wgsl.jinja": "rTbNn4ut45Q/2ugydu7mkyJaRW1fG8YIsx7n2xokyIQ=",
+      "matmul-dot.wgsl.jinja": "Vk0NZJXtQ4MNP+ZvOMU+JnEWUMbpTu6qlFzZJrQULIE=",
+      "matmul-matrix-vector-subgroup.wgsl.jinja": "F8PdETWWUrPS5QSkDYp9rfGRYfZ7EL1Tqq9Wu57O3Vs=",
+      "matmul-notrans-vec4-tiled-reg.wgsl.jinja": "XUMdD1K6mtcBv4nequz201kyrT8FcoJRy+POOKQa+78=",
+      "matmul-subgroup-matrix-ext.wgsl.jinja": "W5PywIfrssv2VQhuCG1lu3LjC3R7VpxGRnkHwMX050Q=",
+      "matmul-tiled-general-reg.wgsl.jinja": "OdjPhBtx7kgvUk7InxpNZnNfPmdf/qbECCJz0CwjKtk=",
+      "matmul-tiled-general.wgsl.jinja": "Uojr2+QidBiM346Ae/dboyLMq/sTPbY33tvj1kZUwmA=",
+      "matmul-vector-matrix-tail.wgsl.jinja": "owfQkSU3cRxrh87xiDAiZFCFy4S3aQJ6EwFZ06ekLCs=",
+      "matmul-vector-matrix-vec4.wgsl.jinja": "KfqMKh1Z8UrqjVRmj6rh3HZDJBq97PttFfEr8XLRxTw=",
+      "matmul-vector-product.wgsl.jinja": "EGOiP0+6B3EoBlKEPvCHgxzDdmMiOiywHceOIpTsZGg=",
+      "matmul.wgsl.jinja": "DR1HIXiYxrxsK0+adkMo0Xns+5JRsBYp+ioQtVn1aEw=",
+      "reduce-axis0-splitk-combine.wgsl.jinja": "uBBEUUxLWHWFF9sdlIgcdZ3y5SlI46mwaa0qtq4oP6E=",
+      "test.json": "hlg+ogQdavnef7sOhP0DfXPHMHGYTzsA8D7/70TTpCI="
+    }
+  },
+  "provenance": { "kernel": { "sha": "c928d21e6cc1310861cba3bafb75f5f679ecf5f3", "dirty": false } },
+  "webgpu": { "manifestSpec": "1.0", "specialized": true, "opPath": "ops/ai.onnx.MatMul" }
+}

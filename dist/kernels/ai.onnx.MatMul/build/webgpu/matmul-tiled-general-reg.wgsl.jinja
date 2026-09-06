@@ -1,0 +1,172 @@
+{% if usesF16 %}
+enable f16;
+{% endif %}
+{{ env.wgsl.resourceDeclarations }}
+
+// Register-blocked MatMul for the no-subgroup-matrix
+// tier: Y = alpha * A @ B. It retains the bounds-checked addressing and
+// batch-broadcast of the general kernel, and its transposed-batch-A layout.
+// Transposed and 1-D operands select other variants and are not handled here.
+// Each thread computes a 4x4 micro-tile within a 64x64 workgroup tile, reusing
+// each staged operand across four accumulators. Both tiles are indexed by their
+// own output axis and group four K values per vector word, so the micro-tile
+// accumulates through dot() and one step reads TM + TN words rather than
+// 4 * (TM + TN) scalars. A stores K contiguously and B stores N contiguously,
+// so each staging lane walks the axis its operand already has.
+{% set aR = source.aRank %}
+{% set bR = source.bRank %}
+{% set aBatchLen = aR - 2 %}
+{% set bBatchLen = bR - 2 %}
+{% set batchRank = aBatchLen %}
+{% set aTailStride = namespace(v=1) %}
+{% for j in range(1, aR) %}{% set aTailStride.v = aTailStride.v * source.aShape[j] %}{% endfor %}
+{% set bTailStride = namespace(v=1) %}
+{% for j in range(1, bR) %}{% set bTailStride.v = bTailStride.v * source.bShape[j] %}{% endfor %}
+{% set M = source.aShape[aR-2] %}{% set K = source.aShape[aR-1] %}{% set N = source.bShape[bR-1] %}
+{% set aMStride = source.aShape[aR-1] %}{% set aKStride = 1 %}{% set bKStride = source.bShape[bR-1] %}{% set bNStride = 1 %}
+
+// Integer MatMul accumulates in its integer type because f32's 24-bit mantissa
+// rounds integer values above 2^24.
+{% set is_int = (scalar == "i32" or scalar == "u32") %}
+{% set accT = scalar if is_int else "f32" %}
+{% set outScalar = source.outScalar if source.outScalar is defined else scalar %}
+// f16 operands stay packed in workgroup memory and widen on shared load.
+// Accumulation remains f32 with the same FMA order, while shared traffic halves.
+{% set tileT = scalar if scalar == "f16" else accT %}
+{% set kTile = source.kTile if source.kTile is defined else 16 %}
+const M: u32 = {{ M }}u;
+const K: u32 = {{ K }}u;
+const N: u32 = {{ N }}u;
+const A_M_STRIDE: u32 = {{ aMStride }}u;
+const A_K_STRIDE: u32 = {{ aKStride }}u;
+const B_K_STRIDE: u32 = {{ bKStride }}u;
+const B_N_STRIDE: u32 = {{ bNStride }}u;
+{% if is_int %}const ALPHA: {{ accT }} = {{ accT }}(1);{% else %}const ALPHA: f32 = f32({{ source.alpha }});{% endif %}
+// A 4x4 micro-tile over a 64x64 output tile reuses each staged operand across
+// four accumulators. It increases arithmetic work per load without the large
+// per-thread accumulator footprint of an 8x8 micro-tile.
+const BK: u32 = {{ kTile }}u;
+const BM: u32 = 64u;
+const BN: u32 = 64u;
+const TM: u32 = 4u;   // per-thread micro-tile rows
+const TN: u32 = 4u;   // per-thread micro-tile cols
+const K_VECS: u32 = BK / 4u;
+var<workgroup> tileA: array<array<vec4<{{ tileT }}>, K_VECS>, BM>;   // A[m][k/4]
+var<workgroup> tileB: array<array<vec4<{{ tileT }}>, K_VECS>, BN>;   // B[n][k/4]
+{% set hasBatchCoord = namespace(value=false) %}
+{% for i in range(batchRank) %}
+{% set axis = batchRank - 1 - i %}
+{% set aAxis = axis - (batchRank - aBatchLen) %}
+{% set bAxis = axis - (batchRank - bBatchLen) %}
+{% set aStored = (aAxis + 1) if (source.transBatchA and aAxis >= 0) else aAxis %}
+{% set bStored = bAxis %}
+{% set aDim = source.aShape[aStored] %}
+{% set bDim = source.bShape[bStored] if bStored >= 0 else 1 %}
+{% if aDim > 1 or bDim > 1 %}{% set hasBatchCoord.value = true %}{% endif %}
+{% endfor %}
+
+@compute @workgroup_size(16, 16, 1)
+fn main(
+  @builtin(workgroup_id) wg: vec3<u32>,
+  @builtin(local_invocation_id) lid: vec3<u32>
+) {
+  let mBase = wg.y * BM;
+  let nBase = wg.x * BN;
+  let li = lid.y * 16u + lid.x;
+
+  let zOut = wg.z;
+{% if hasBatchCoord.value %}
+  var zTmp = wg.z;
+{% endif %}
+  var aBatchOff: u32 = 0u;
+  var bBatchOff: u32 = 0u;
+{% for i in range(batchRank) %}
+{% set axis = batchRank - 1 - i %}
+{% set aAxis = axis - (batchRank - aBatchLen) %}
+{% set bAxis = axis - (batchRank - bBatchLen) %}
+{% set aStored = (aAxis + 1) if (source.transBatchA and aAxis >= 0) else aAxis %}
+{% set bStored = bAxis %}
+{% set aDim = source.aShape[aStored] %}
+{% set bDim = source.bShape[bStored] if bStored >= 0 else 1 %}
+{% set outDim = aDim if aDim >= bDim else bDim %}
+{% set aStride = namespace(v=1) %}
+{% if aStored >= 0 and aDim != 1 %}{% for j in range(aStored + 1, aR) %}{% set aStride.v = aStride.v * source.aShape[j] %}{% endfor %}{% else %}{% set aStride.v = 0 %}{% endif %}
+{% set bStride = namespace(v=1) %}
+{% if bStored >= 0 and bDim != 1 %}{% for j in range(bStored + 1, bR) %}{% set bStride.v = bStride.v * source.bShape[j] %}{% endfor %}{% else %}{% set bStride.v = 0 %}{% endif %}
+{% if outDim > 1 %}
+  let c{{ axis }} = zTmp % {{ outDim }}u;
+  zTmp = zTmp / {{ outDim }}u;
+{% if aStride.v != 0 %}  aBatchOff = aBatchOff + c{{ axis }} * {{ aStride.v }}u;
+{% endif %}
+{% if bStride.v != 0 %}  bBatchOff = bBatchOff + c{{ axis }} * {{ bStride.v }}u;
+{% endif %}
+{% endif %}
+{% endfor %}
+
+  var acc: array<{{ accT }}, TM * TN>;   // [ti*TN + tj] for the TMxTN micro-tile
+  for (var i: u32 = 0u; i < TM * TN; i = i + 1u) { acc[i] = {{ accT }}(0); }
+
+  let numTiles = (K + BK - 1u) / BK;
+  for (var kt: u32 = 0u; kt < numTiles; kt = kt + 1u) {
+    let kBase = kt * BK;
+    // Cooperative load: one vector word per lane per pass. A's lanes walk K, which
+    // it stores contiguously; B's walk N, which it stores contiguously.
+    for (var idx: u32 = li; idx < BM * K_VECS; idx = idx + 256u) {
+      let ar = idx / K_VECS;
+      let ac4 = idx % K_VECS;
+      let am = mBase + ar;
+      let ak = kBase + ac4 * 4u;
+      var aWord = vec4<{{ tileT }}>({{ tileT }}(0));
+      if (am < M) {
+        let aRowOff = aBatchOff + am * A_M_STRIDE;
+{% for component in range(4) %}
+        if (ak + {{ component }}u < K) { aWord[{{ component }}u] = {{ tileT }}(a[aRowOff + (ak + {{ component }}u) * A_K_STRIDE]); }
+{% endfor %}
+      }
+      tileA[ar][ac4] = aWord;
+    }
+    for (var idx: u32 = li; idx < BN * K_VECS; idx = idx + 256u) {
+      let bc = idx % BN;
+      let br4 = idx / BN;
+      let bn = nBase + bc;
+      let bk = kBase + br4 * 4u;
+      var bWord = vec4<{{ tileT }}>({{ tileT }}(0));
+      if (bn < N) {
+        let bColOff = bBatchOff + bn * B_N_STRIDE;
+{% for component in range(4) %}
+        if (bk + {{ component }}u < K) { bWord[{{ component }}u] = {{ tileT }}(b[bColOff + (bk + {{ component }}u) * B_K_STRIDE]); }
+{% endfor %}
+      }
+      tileB[bc][br4] = bWord;
+    }
+    workgroupBarrier();
+{% set regIndent = "    " %}{% set regT = accT %}{{ regIndent }}let aRow = lid.y * TM;
+{{ regIndent }}let bCol = lid.x * TN;
+{{ regIndent }}for (var kv: u32 = 0u; kv < BK / 4u; kv = kv + 1u) {
+{{ regIndent }}  var av: array<vec4<{{ regT }}>, TM>;
+{{ regIndent }}  var bv: array<vec4<{{ regT }}>, TN>;
+{{ regIndent }}  for (var i: u32 = 0u; i < TM; i = i + 1u) { av[i] = vec4<{{ regT }}>(tileA[aRow + i][kv]); }
+{{ regIndent }}  for (var j: u32 = 0u; j < TN; j = j + 1u) { bv[j] = vec4<{{ regT }}>(tileB[bCol + j][kv]); }
+{{ regIndent }}  for (var i: u32 = 0u; i < TM; i = i + 1u) {
+{{ regIndent }}    for (var j: u32 = 0u; j < TN; j = j + 1u) {
+{{ regIndent }}      acc[i * TN + j] = acc[i * TN + j] + dot(av[i], bv[j]);
+{{ regIndent }}    }
+{{ regIndent }}  }
+{{ regIndent }}}
+    workgroupBarrier();
+  }
+
+  let rowBase = zOut * M * N;
+  let m0 = mBase + lid.y * TM;
+  let n0 = nBase + lid.x * TN;
+  for (var ti: u32 = 0u; ti < TM; ti = ti + 1u) {
+    let m = m0 + ti;
+    if (m >= M) { continue; }
+    for (var tj: u32 = 0u; tj < TN; tj = tj + 1u) {
+      let n = n0 + tj;
+      if (n < N) {
+        y[rowBase + m * N + n] = {{ outScalar }}(ALPHA * acc[ti * TN + tj]);
+      }
+    }
+  }
+}

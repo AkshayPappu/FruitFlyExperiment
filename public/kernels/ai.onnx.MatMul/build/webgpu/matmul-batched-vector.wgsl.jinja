@@ -1,0 +1,50 @@
+{% if T == "f16" %}
+enable f16;
+{% endif %}
+{{ env.wgsl.resourceDeclarations }}
+
+@compute @workgroup_size({{ fallbackTile }}, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>,
+        @builtin(num_workgroups) nwg: vec3<u32>) {
+  let output_index = gid.x + gid.y * nwg.x * {{ fallbackTile }}u;
+  if (output_index >= params.outputWidth) {
+    return;
+  }
+  // workgroup_size.z = 1, so nwg.z is the grid stride over flattened batches.
+  for (var batch = gid.z; batch < params.batchCount; batch += nwg.z) {
+{% if T == "i32" or T == "u32" %}
+    var acc = {{ T }}(0);
+{% else %}
+    var acc = 0.0;
+{% endif %}
+{% if vectorOnLeft %}
+    let b_base = batch * params.K * params.outputWidth;
+    for (var k = 0u; k < params.K; k += 1u) {
+{% if T == "i32" or T == "u32" %}
+      acc += a[k] * b[b_base + k * params.outputWidth + output_index];
+{% else %}
+      acc += f32(a[k]) * f32(b[b_base + k * params.outputWidth + output_index]);
+{% endif %}
+    }
+{% if T == "i32" or T == "u32" %}
+    y[batch * params.outputWidth + output_index] = acc;
+{% else %}
+    y[batch * params.outputWidth + output_index] = {{ T }}(acc);
+{% endif %}
+{% else %}
+    let a_base = (batch * params.outputWidth + output_index) * params.K;
+    for (var k = 0u; k < params.K; k += 1u) {
+{% if T == "i32" or T == "u32" %}
+      acc += a[a_base + k] * b[k];
+{% else %}
+      acc += f32(a[a_base + k]) * f32(b[k]);
+{% endif %}
+    }
+{% if T == "i32" or T == "u32" %}
+    y[batch * params.outputWidth + output_index] = acc;
+{% else %}
+    y[batch * params.outputWidth + output_index] = {{ T }}(acc);
+{% endif %}
+{% endif %}
+  }
+}

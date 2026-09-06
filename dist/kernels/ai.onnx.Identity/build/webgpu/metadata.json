@@ -1,0 +1,19 @@
+{
+  "name": "ai.onnx.Identity",
+  "id": "_ai_onnx_identity_webgpu_ead6cd9",
+  "version": 1,
+  "license": "Apache-2.0",
+  "backend": { "type": "webgpu" },
+  "digest": {
+    "algorithm": "sha256",
+    "files": {
+      "bench.json": "iqLD60NoNy/WX0qdR5TO8/AK4j21dKyPOFD317acAH4=",
+      "datamove-elementwise-copy.wgsl.jinja": "J5yC2bAddPiP+odXLgVGS3TJ9jeNsfRTvedKrj/fhZg=",
+      "datamove-flat-copy.wgsl.jinja": "rEpeYMvIZQuQnB2f3lt51jrrklKICsqUTzCJPRTknNk=",
+      "manifest.json": "reU3MC1V59I8kks+xwBlyge3ffTsAigWVsSR94J5+cY=",
+      "test.json": "OFNAvELh9Hoap8iYTP7wEbReNVAlq3vq5wb82eROxcw="
+    }
+  },
+  "provenance": { "kernel": { "sha": "2e7068faf55e7f43df740015f6d1ee49391a41c5", "dirty": false } },
+  "webgpu": { "manifestSpec": "1.0", "specialized": true, "opPath": "ops/ai.onnx.Identity" }
+}

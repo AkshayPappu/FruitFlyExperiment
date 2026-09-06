@@ -1,0 +1,72 @@
+// GEMV specialization for y[M] = A[M, K] @ b[K]: one 32-wide workgroup per
+// output row. Packed inputs use vec4 steps; the tail-safe form keeps scalar
+// storage and neighboring lanes read neighboring elements. Both accumulate in
+// f32 and share the same row fold.
+//
+// The subgroup form requires a fixed width of 32 so one subgroupAdd folds all
+// partials. The no-subgroup form uses a barrier tree over shared partials.
+{% if useSubgroups is not defined %}{% set useSubgroups = true %}{% endif %}
+{% if usesF16 %}
+enable f16;
+{% endif %}
+{% if useSubgroups %}
+enable subgroups;
+{% if pinSubgroupSize32 %}
+enable subgroup_size_control;
+{% endif %}
+{% endif %}
+
+{{ env.wgsl.resourceDeclarations }}
+{% if not useSubgroups %}
+
+var<workgroup> partials: array<f32, 32>;
+
+{% endif %}
+@compute @workgroup_size(32, 1, 1){{ " @subgroup_size(32)" if useSubgroups and pinSubgroupSize32 else "" }}
+fn main(
+  @builtin(workgroup_id) workgroup_id: vec3<u32>,
+  @builtin(num_workgroups) num_workgroups: vec3<u32>,
+  @builtin(local_invocation_id) lid: vec3<u32>{% if useSubgroups %},
+  @builtin(subgroup_size) sg_size: u32{% endif %}
+) {
+{% if useSubgroups %}
+  // This path is width-gated to exactly 32 lanes.
+  if (sg_size < 32u) { return; }
+{% endif %}
+  let row = workgroup_id.x + workgroup_id.y * num_workgroups.x;
+  if (row >= params.M) {
+    return;
+  }
+  let lane = lid.x;
+  var acc = 0.0;
+{% if packedInput %}
+  let row_base = row * params.K4;
+  for (var k4 = lane; k4 < params.K4; k4 = k4 + 32u) {
+    acc = acc + dot(vec4<f32>(a[row_base + k4]), vec4<f32>(b[k4]));
+  }
+{% else %}
+  let row_base = row * params.K;
+  for (var k = lane; k < params.K; k = k + 32u) {
+    acc = acc + f32(a[row_base + k]) * f32(b[k]);
+  }
+{% endif %}
+{% if useSubgroups %}
+  let total = subgroupAdd(acc);
+  if (lane == 0u) {
+    y[row] = {{ T }}(total);
+  }
+{% else %}
+  // No-subgroup tier: barrier tree-reduction over the 32 per-lane partials.
+  partials[lane] = acc;
+  workgroupBarrier();
+  for (var s: u32 = 16u; s > 0u; s = s >> 1u) {
+    if (lane < s) {
+      partials[lane] = partials[lane] + partials[lane + s];
+    }
+    workgroupBarrier();
+  }
+  if (lane == 0u) {
+    y[row] = {{ T }}(partials[0]);
+  }
+{% endif %}
+}

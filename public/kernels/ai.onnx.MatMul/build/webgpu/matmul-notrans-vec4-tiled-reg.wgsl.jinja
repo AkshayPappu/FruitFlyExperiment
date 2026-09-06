@@ -1,0 +1,116 @@
+{% if usesF16 %}
+enable f16;
+{% endif %}
+{{ env.wgsl.resourceDeclarations }}
+{% set kTileValue = kTile %}
+{% set blockRowsValue = blockRows if blockRows is defined else 128 %}
+{% set blockColsValue = blockCols if blockCols is defined else 64 %}
+{% set outputScalarValue = outputScalar if outputScalar is defined else scalar %}
+{% set accumulatorScalarValue = accumulatorScalar if accumulatorScalar is defined else "f32" %}
+{% set threadRows = (blockRowsValue / 16)|int %}
+{% set threadColVectors = (blockColsValue / 64)|int %}
+{% set threadCols = threadColVectors * 4 %}
+{% set aVectorCount = (blockRowsValue * kTileValue / 1024)|int %}
+{% set bVectorCount = (kTileValue * blockColsValue / 1024)|int %}
+
+// High-intensity matrix multiplication for the large, untransposed layout:
+//   Y[M,N] = alpha * A[M,K] @ B[K,N].
+// B may alternatively be stored physically as [N,K]; that mode retains vec4
+// K loads and transposes only while staging the tile in workgroup memory.
+//
+// Both inputs and the output are four-wide along their contiguous dimension.
+// The output-tile geometry and BK are selected from the shape and device's
+// workgroup-storage limit. f16 operands stay packed in global and workgroup
+// memory, then widen at the FMA so accumulation remains f32.
+const M: u32 = {{ M }}u;
+const K: u32 = {{ K }}u;
+const N: u32 = {{ N }}u;
+const K_V4: u32 = K / 4u;
+const N_V4: u32 = N / 4u;
+const BK: u32 = {{ kTileValue }}u;
+const BM: u32 = {{ blockRowsValue }}u;
+const BN: u32 = {{ blockColsValue }}u;
+const TM: u32 = {{ threadRows }}u;
+const TN: u32 = {{ threadCols }}u;
+
+var<workgroup> tileA: array<array<{{ scalar }}, BK>, BM>;
+var<workgroup> tileB: array<array<{{ scalar }}, BN + 1u>, BK>;
+
+@compute @workgroup_size(16, 16, 1)
+fn main(
+  @builtin(workgroup_id) wg: vec3<u32>,
+  @builtin(local_invocation_id) lid: vec3<u32>
+) {
+  let li = lid.y * 16u + lid.x;
+  let mBase = wg.y * BM;
+  let nBase = wg.x * BN;
+
+{% for i in range(threadRows) %}
+{% for j in range(threadColVectors) %}
+  var acc{{ i }}_{{ j }} = vec4<{{ accumulatorScalarValue }}>(0.0);
+{% endfor %}
+{% endfor %}
+
+  for (var kBase: u32 = 0u; kBase < K; kBase = kBase + BK) {
+{% for av in range(aVectorCount) %}
+    let aVector{{ av }} = li + {{ av * 256 }}u;
+    let aRow{{ av }} = aVector{{ av }} / (BK / 4u);
+    let aColV4_{{ av }} = aVector{{ av }} % (BK / 4u);
+    let am{{ av }} = mBase + aRow{{ av }};
+    var av4_{{ av }} = vec4<{{ scalar }}>({{ scalar }}(0));
+    if (am{{ av }} < M) {
+      av4_{{ av }} = a[am{{ av }} * K_V4 + kBase / 4u + aColV4_{{ av }}];
+    }
+    tileA[aRow{{ av }}][aColV4_{{ av }} * 4u + 0u] = av4_{{ av }}.x;
+    tileA[aRow{{ av }}][aColV4_{{ av }} * 4u + 1u] = av4_{{ av }}.y;
+    tileA[aRow{{ av }}][aColV4_{{ av }} * 4u + 2u] = av4_{{ av }}.z;
+    tileA[aRow{{ av }}][aColV4_{{ av }} * 4u + 3u] = av4_{{ av }}.w;
+{% endfor %}
+{% for bv in range(bVectorCount) %}
+    let bVector{{ bv }} = li + {{ bv * 256 }}u;
+    let bRow{{ bv }} = bVector{{ bv }} / (BN / 4u);
+    let bColV4_{{ bv }} = bVector{{ bv }} % (BN / 4u);
+    let bn{{ bv }} = nBase + bColV4_{{ bv }} * 4u;
+    var bv4_{{ bv }} = vec4<{{ scalar }}>({{ scalar }}(0));
+    if (bn{{ bv }} < N) {
+      bv4_{{ bv }} = b[(kBase + bRow{{ bv }}) * N_V4 + bn{{ bv }} / 4u];
+    }
+    tileB[bRow{{ bv }}][bColV4_{{ bv }} * 4u + 0u] = bv4_{{ bv }}.x;
+    tileB[bRow{{ bv }}][bColV4_{{ bv }} * 4u + 1u] = bv4_{{ bv }}.y;
+    tileB[bRow{{ bv }}][bColV4_{{ bv }} * 4u + 2u] = bv4_{{ bv }}.z;
+    tileB[bRow{{ bv }}][bColV4_{{ bv }} * 4u + 3u] = bv4_{{ bv }}.w;
+{% endfor %}
+    workgroupBarrier();
+
+    let aRow = lid.y * TM;
+    let bCol = lid.x * TN;
+    for (var kk: u32 = 0u; kk < BK; kk = kk + 1u) {
+{% for j in range(threadColVectors) %}
+      let bv{{ j }} = vec4<{{ accumulatorScalarValue }}>(
+        {{ accumulatorScalarValue }}(tileB[kk][bCol + {{ j * 4 + 0 }}u]), {{ accumulatorScalarValue }}(tileB[kk][bCol + {{ j * 4 + 1 }}u]),
+        {{ accumulatorScalarValue }}(tileB[kk][bCol + {{ j * 4 + 2 }}u]), {{ accumulatorScalarValue }}(tileB[kk][bCol + {{ j * 4 + 3 }}u])
+      );
+{% endfor %}
+{% for i in range(threadRows) %}
+{% for j in range(threadColVectors) %}
+      acc{{ i }}_{{ j }} = acc{{ i }}_{{ j }} + vec4<{{ accumulatorScalarValue }}>({{ accumulatorScalarValue }}(tileA[aRow + {{ i }}u][kk])) * bv{{ j }};
+{% endfor %}
+{% endfor %}
+    }
+    workgroupBarrier();
+  }
+
+  let m0 = mBase + lid.y * TM;
+{% for j in range(threadColVectors) %}
+  let n{{ j }} = nBase + lid.x * TN + {{ j * 4 }}u;
+{% endfor %}
+{% for i in range(threadRows) %}
+{% for j in range(threadColVectors) %}
+  if (m0 + {{ i }}u < M && n{{ j }} < N) {
+    y[(m0 + {{ i }}u) * N_V4 + n{{ j }} / 4u] = vec4<{{ outputScalarValue }}>(select(
+      vec4<f32>(acc{{ i }}_{{ j }}) * vec4<f32>(params.alpha), vec4<f32>(0.0), params.alpha == 0.0
+    ){% if hasBias is defined and hasBias %} + vec4<f32>(bias[n{{ j }} / 4u]){% endif %});
+  }
+{% endfor %}
+{% endfor %}
+}

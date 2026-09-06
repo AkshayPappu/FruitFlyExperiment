@@ -1,0 +1,49 @@
+{% if T == "f16" %}
+enable f16;
+{% endif %}
+{{ env.wgsl.resourceDeclarations }}
+
+// Batch dimensions are right-aligned in Params. A rank-3 input therefore uses
+// batch2, rank 4 uses batch1..2, and rank 5 uses batch0..2. The same addressing
+// handles equal batches, broadcast dimensions, and rank-padded operands.
+@compute @workgroup_size({{ fallbackTile }}, {{ fallbackTile }}, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) num_wg: vec3<u32>) {
+  let batch12 = params.batch1 * params.batch2;
+  let batch_count = params.batch0 * batch12;
+  // Every dispatch axis is clamped to the device limit. Grid-striding keeps
+  // every output reachable when a column, row, or flattened batch axis exceeds it.
+  let col_stride = num_wg.x * {{ fallbackTile }}u;
+  let row_stride = num_wg.y * {{ fallbackTile }}u;
+  for (var col = gid.x; col < params.N; col += col_stride) {
+    for (var batch = gid.z; batch < batch_count; batch += num_wg.z) {
+      let out_b0 = batch / batch12;
+      let rem = batch % batch12;
+      let out_b1 = rem / params.batch2;
+      let out_b2 = rem % params.batch2;
+      let a_b0 = select(0u, out_b0, params.aBatch0 > 1u);
+      let a_b1 = select(0u, out_b1, params.aBatch1 > 1u);
+      let a_b2 = select(0u, out_b2, params.aBatch2 > 1u);
+      let b_b0 = select(0u, out_b0, params.bBatch0 > 1u);
+      let b_b1 = select(0u, out_b1, params.bBatch1 > 1u);
+      let b_b2 = select(0u, out_b2, params.bBatch2 > 1u);
+      let a_batch_base = (((a_b0 * params.aBatch1 + a_b1) * params.aBatch2 + a_b2) * params.M) * params.K;
+      let b_batch_base = (((b_b0 * params.bBatch1 + b_b1) * params.bBatch2 + b_b2) * params.K) * params.N;
+      for (var row = gid.y; row < params.M; row += row_stride) {
+{% if T == "i32" or T == "u32" %}
+        // Integer MatMul accumulates natively: f32 would round values above 2^24.
+        var acc: {{ T }} = {{ T }}(0);
+        for (var k = 0u; k < params.K; k = k + 1u) {
+          acc += a[a_batch_base + row * params.K + k] * b[b_batch_base + k * params.N + col];
+        }
+        y[(batch * params.M + row) * params.N + col] = acc;
+{% else %}
+        var acc = 0.0;
+        for (var k = 0u; k < params.K; k = k + 1u) {
+          acc += f32(a[a_batch_base + row * params.K + k]) * f32(b[b_batch_base + k * params.N + col]);
+        }
+        y[(batch * params.M + row) * params.N + col] = {{ T }}(acc);
+{% endif %}
+      }
+    }
+  }
+}

@@ -1,0 +1,165 @@
+{% if usesF16 %}
+enable f16;
+{% endif %}
+{{ env.wgsl.resourceDeclarations }}
+
+// Shared tiled matrix multiplication: Y = alpha * op(A) @ op(B), where op
+// transposes the last two axes when requested. This bounds-checked kernel
+// handles any M/K/N (no alignment requirement), all four transpose combinations,
+// right-aligned batch broadcasting, 1-D operand promotion (M==1 / N==1), and empty
+// K/M/N. transA/transB only change which stored stride the logical (m,k)/(k,n)
+// walk, using compiled stride constants here; the batch broadcast strides are
+// compiled the same way (a 0 literal means "broadcast / absent on that operand").
+{% set aR = source.aRank %}
+{% set bR = source.bRank %}
+{% set aVec = (aR == 1) %}
+{% set bVec = (bR == 1) %}
+{% set aBatchLen = (aR - 2) if aR >= 2 else 0 %}
+{% set bBatchLen = (bR - 2) if bR >= 2 else 0 %}
+{% set batchRank = aBatchLen if aBatchLen >= bBatchLen else bBatchLen %}
+/* transBatch maps stored [d0, d1, ..., dR-2, dR-1] to logical
+ * [d1, ..., dR-2, d0, dR-1]. Stored axis zero becomes the M axis, the final K
+ * axis is unchanged, and the remaining axes form the batch. This stride
+ * permutation composes with the ordinary last-two-axis transpose. */
+{% set aTailStride = namespace(v=1) %}
+{% for j in range(1, aR) %}{% set aTailStride.v = aTailStride.v * source.aShape[j] %}{% endfor %}
+{% set bTailStride = namespace(v=1) %}
+{% for j in range(1, bR) %}{% set bTailStride.v = bTailStride.v * source.bShape[j] %}{% endfor %}
+{% if aVec %}{% set M = 1 %}{% set K = source.aShape[0] %}
+{% else %}{% set M = source.aShape[aR-2] %}{% set K = source.aShape[aR-1] %}{% endif %}
+{% if bVec %}{% set N = 1 %}
+{% else %}{% set N = source.bShape[bR-1] %}{% endif %}
+{% if aVec %}{% set aMStride = 0 %}{% set aKStride = 1 %}
+{% else %}{% set aMStride = source.aShape[aR-1] %}{% set aKStride = 1 %}{% endif %}
+{% if bVec %}{% set bKStride = 1 %}{% set bNStride = 0 %}
+{% else %}{% set bKStride = source.bShape[bR-1] %}{% set bNStride = 1 %}{% endif %}
+
+{% set is_int = (scalar == "i32" or scalar == "u32") %}
+{% set accT = scalar if is_int else "f32" %}
+{% set tileT = scalar if scalar == "f16" else accT %}
+const M: u32 = {{ M }}u;
+const K: u32 = {{ K }}u;
+const N: u32 = {{ N }}u;
+const A_M_STRIDE: u32 = {{ aMStride }}u;
+const A_K_STRIDE: u32 = {{ aKStride }}u;
+const B_K_STRIDE: u32 = {{ bKStride }}u;
+const B_N_STRIDE: u32 = {{ bNStride }}u;
+{% if is_int %}/* Integer matrix multiplication accumulates in the integer type. Widening
+ * through f32 would round values above 2^24. Integer MatMul has alpha = 1. */
+const ALPHA: {{ accT }} = {{ accT }}(1);{% else %}const ALPHA: f32 = f32({{ source.alpha }});{% endif %}
+// 2x2 register-blocked tile: 16x16 threads each compute a 2x2 micro-tile, for a
+// 32x32 output tile per workgroup with K stepped in BK=16 chunks. Each loaded
+// shared-mem element feeds 2 FMAs, favoring register reuse in the inner loop.
+const BK: u32 = 16u;
+const BM: u32 = 32u;
+const BN: u32 = 32u;
+
+var<workgroup> tileA: array<array<{{ tileT }}, 16>, 32>;
+var<workgroup> tileB: array<array<{{ tileT }}, 32>, 16>;
+{% set hasBatchCoord = namespace(value=false) %}
+{% for i in range(batchRank) %}
+{% set axis = batchRank - 1 - i %}
+{% set aAxis = axis - (batchRank - aBatchLen) %}
+{% set bAxis = axis - (batchRank - bBatchLen) %}
+{% set aStored = (aAxis + 1) if (source.transBatchA and aAxis >= 0) else aAxis %}
+{% set bStored = (bAxis + 1) if (source.transBatchB and bAxis >= 0) else bAxis %}
+{% set aDim = source.aShape[aStored] if aStored >= 0 else 1 %}
+{% set bDim = source.bShape[bStored] if bStored >= 0 else 1 %}
+{% if aDim > 1 or bDim > 1 %}{% set hasBatchCoord.value = true %}{% endif %}
+{% endfor %}
+
+@compute @workgroup_size(16, 16, 1)
+fn main(
+  @builtin(workgroup_id) wg: vec3<u32>,
+  @builtin(local_invocation_id) lid: vec3<u32>
+) {
+  let mBase = wg.y * BM;
+  let nBase = wg.x * BN;
+  let li = lid.y * 16u + lid.x;
+
+  // Per-batch base offsets into A and B using right-aligned broadcast strides.
+  // Decompose the flat output-batch index from the innermost axis outward.
+  let zOut = wg.z;
+{% if hasBatchCoord.value %}
+  var zTmp = wg.z;
+{% endif %}
+  var aBatchOff: u32 = 0u;
+  var bBatchOff: u32 = 0u;
+{% for i in range(batchRank) %}
+{% set axis = batchRank - 1 - i %}
+{% set aAxis = axis - (batchRank - aBatchLen) %}
+{% set bAxis = axis - (batchRank - bBatchLen) %}
+{% set aStored = (aAxis + 1) if (source.transBatchA and aAxis >= 0) else aAxis %}
+{% set bStored = (bAxis + 1) if (source.transBatchB and bAxis >= 0) else bAxis %}
+{% set aDim = source.aShape[aStored] if aStored >= 0 else 1 %}
+{% set bDim = source.bShape[bStored] if bStored >= 0 else 1 %}
+{% set outDim = aDim if aDim >= bDim else bDim %}
+{% set aStride = namespace(v=1) %}
+{% if aStored >= 0 and aDim != 1 %}{% for j in range(aStored + 1, aR) %}{% set aStride.v = aStride.v * source.aShape[j] %}{% endfor %}{% else %}{% set aStride.v = 0 %}{% endif %}
+{% set bStride = namespace(v=1) %}
+{% if bStored >= 0 and bDim != 1 %}{% for j in range(bStored + 1, bR) %}{% set bStride.v = bStride.v * source.bShape[j] %}{% endfor %}{% else %}{% set bStride.v = 0 %}{% endif %}
+{% if outDim > 1 %}
+{% if aStride.v != 0 or bStride.v != 0 %}
+  let c{{ axis }} = zTmp % {{ outDim }}u;
+{% endif %}
+  zTmp = zTmp / {{ outDim }}u;
+{% if aStride.v != 0 %}  aBatchOff = aBatchOff + c{{ axis }} * {{ aStride.v }}u;
+{% endif %}
+{% if bStride.v != 0 %}  bBatchOff = bBatchOff + c{{ axis }} * {{ bStride.v }}u;
+{% endif %}
+{% endif %}
+{% endfor %}
+
+  var acc00: {{ accT }} = {{ accT }}(0);
+  var acc01: {{ accT }} = {{ accT }}(0);
+  var acc10: {{ accT }} = {{ accT }}(0);
+  var acc11: {{ accT }} = {{ accT }}(0);
+  let numTiles = (K + BK - 1u) / BK;
+  for (var kt: u32 = 0u; kt < numTiles; kt = kt + 1u) {
+    let kBase = kt * BK;
+    // Cooperative load: 32x16 A tile + 16x32 B tile, 256 threads x 2 each.
+    for (var e: u32 = 0u; e < 2u; e = e + 1u) {
+      let idx = li + e * 256u;
+      let ar = idx / BK;
+      let ac = idx % BK;
+      let am = mBase + ar;
+      let ak = kBase + ac;
+      if (am < M && ak < K) {
+        tileA[ar][ac] = {{ tileT }}(a[aBatchOff + am * A_M_STRIDE + ak * A_K_STRIDE]);
+      } else {
+        tileA[ar][ac] = {{ tileT }}(0);
+      }
+      let br = idx / BN;
+      let bc = idx % BN;
+      let bk = kBase + br;
+      let bn = nBase + bc;
+      if (bk < K && bn < N) {
+        tileB[br][bc] = {{ tileT }}(b[bBatchOff + bk * B_K_STRIDE + bn * B_N_STRIDE]);
+      } else {
+        tileB[br][bc] = {{ tileT }}(0);
+      }
+    }
+    workgroupBarrier();
+    for (var kk: u32 = 0u; kk < BK; kk = kk + 1u) {
+      let a0 = {{ accT }}(tileA[lid.y * 2u][kk]);
+      let a1 = {{ accT }}(tileA[lid.y * 2u + 1u][kk]);
+      let b0 = {{ accT }}(tileB[kk][lid.x * 2u]);
+      let b1 = {{ accT }}(tileB[kk][lid.x * 2u + 1u]);
+      acc00 = acc00 + a0 * b0;
+      acc01 = acc01 + a0 * b1;
+      acc10 = acc10 + a1 * b0;
+      acc11 = acc11 + a1 * b1;
+    }
+    workgroupBarrier();
+  }
+
+  let m0 = mBase + lid.y * 2u;
+  let m1 = m0 + 1u;
+  let n0 = nBase + lid.x * 2u;
+  let n1 = n0 + 1u;
+  let rowBase = zOut * M * N;
+  if (m0 < M && n0 < N) { y[rowBase + m0 * N + n0] = {{ scalar }}(ALPHA * acc00); }
+  if (m0 < M && n1 < N) { y[rowBase + m0 * N + n1] = {{ scalar }}(ALPHA * acc01); }
+  if (m1 < M && n0 < N) { y[rowBase + m1 * N + n0] = {{ scalar }}(ALPHA * acc10); }
+  if (m1 < M && n1 < N) { y[rowBase + m1 * N + n1] = {{ scalar }}(ALPHA * acc11); }
+}

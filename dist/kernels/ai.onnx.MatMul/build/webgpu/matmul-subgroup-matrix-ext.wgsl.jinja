@@ -1,0 +1,388 @@
+// Subgroup-matrix matmul over row-major, batch-outermost operands, with alpha,
+// dense/broadcast batching and guarded K/N tails under `generalAddressing`, and
+// an optional fused bias on the direct dense path that omits it.
+{% if usesF16 %}
+enable f16;
+{% endif %}
+enable subgroups;
+{% if pinSubgroupSize32 %}
+enable subgroup_size_control;
+{% endif %}
+enable chromium_experimental_subgroup_matrix;
+diagnostic(off, chromium.subgroup_matrix_uniformity);
+
+{{ env.wgsl.resourceDeclarations }}
+
+{% set operandScalar = fScalar %}
+{% set accScalar = "f32" %}
+{% set GENERAL = generalAddressing is defined and generalAddressing %}
+{% set TAIL = tailSafe is defined and tailSafe %}
+{% set SPLIT_K = splitK if splitK is defined else 1 %}
+{% set OUT = outputBuffer if outputBuffer is defined else "c" %}
+{% set OUT_SCALAR = outScalar if outScalar is defined else T %}
+{% if GENERAL %}
+{% set aR = source.aRank %}
+{% set bR = source.bRank %}
+{% set aBatchLen = aR - 2 %}
+{% set bBatchLen = bR - 2 %}
+{% set batchRank = aBatchLen %}
+{% set aMStride = source.aShape[aR-1] %}
+{% set aKStride = 1 %}
+{% set bKStride = source.bShape[bR-1] %}
+{% set bNStride = 1 %}
+{% endif %}
+
+const M: u32 = {{ M }}u;
+const K: u32 = {{ K }}u;
+const N: u32 = {{ N }}u;
+const BATCH_COUNT: u32 = {{ batchCount if batchCount is defined else 1 }}u;
+{% if SPLIT_K > 1 %}
+const SPLIT_K: u32 = {{ SPLIT_K }}u;
+const K_PER_SPLIT: u32 = {{ kPerSplit }}u;
+{% endif %}
+{% if GENERAL %}
+const A_M_STRIDE: u32 = {{ aMStride }}u;
+const A_K_STRIDE: u32 = {{ aKStride }}u;
+const B_K_STRIDE: u32 = {{ bKStride }}u;
+const B_N_STRIDE: u32 = {{ bNStride }}u;
+{% if TAIL %}const K_FULL: u32 = (K / 32u) * 32u;
+{% endif %}
+const ALPHA: f32 = f32({{ alpha }});
+{% else %}
+const A_BATCH_STRIDE: u32 = M * K;
+const B_BATCH_STRIDE: u32 = K * N;
+{% endif %}
+const C_BATCH_STRIDE: u32 = M * N;
+const TILE_COLS: u32 = 64u;
+const TILE_ROWS: u32 = 32u;
+const TILE_K: u32 = 32u;
+const SUB_COLS: u32 = 32u;
+const SUB_ROWS: u32 = 16u;
+
+var<workgroup> tile_A: array<{{ operandScalar }}, 32 * 32>;
+var<workgroup> tile_B: array<{{ operandScalar }}, 64 * 32>;
+var<workgroup> scratch: array<array<array<{{ accScalar }}, 64>, 4>, 4>;
+
+fn loadSHMA(a_base: u32, tile_base: u32, k_idx: u32, row: u32, c_idx: u32) {
+  let a_global = tile_base + row;
+  let col = c_idx * 8u;
+  for (var col_offset = 0u; col_offset < 8u; col_offset = col_offset + 1u) {
+    let k = k_idx + col + col_offset;
+    if (a_global < M) {
+{% if operandScalar == "f16" %}
+{% if GENERAL %}
+      tile_A[row * TILE_K + col + col_offset] = f16(a[a_base + a_global * A_M_STRIDE + k * A_K_STRIDE]);
+{% else %}
+      tile_A[row * TILE_K + col + col_offset] = f16(a[a_base + a_global * K + k]);
+{% endif %}
+{% else %}
+{% if GENERAL %}
+      tile_A[row * TILE_K + col + col_offset] = f32(a[a_base + a_global * A_M_STRIDE + k * A_K_STRIDE]);
+{% else %}
+      tile_A[row * TILE_K + col + col_offset] = f32(a[a_base + a_global * K + k]);
+{% endif %}
+{% endif %}
+    } else {
+{% if operandScalar == "f16" %}
+      tile_A[row * TILE_K + col + col_offset] = 0.0h;
+{% else %}
+      tile_A[row * TILE_K + col + col_offset] = 0.0;
+{% endif %}
+    }
+  }
+}
+{% if GENERAL and TAIL %}
+
+fn loadSHMAKTail(a_base: u32, tile_base: u32, k_idx: u32, row: u32, c_idx: u32) {
+  let a_global = tile_base + row;
+  let col = c_idx * 8u;
+  for (var col_offset = 0u; col_offset < 8u; col_offset = col_offset + 1u) {
+    let k = k_idx + col + col_offset;
+    if (a_global < M && k < K) {
+      tile_A[row * TILE_K + col + col_offset] = {{ operandScalar }}(a[a_base + a_global * A_M_STRIDE + k * A_K_STRIDE]);
+    } else {
+      tile_A[row * TILE_K + col + col_offset] = {{ operandScalar }}(0);
+    }
+  }
+}
+
+{% endif %}
+fn loadSHMB(b_base: u32, tile_base: u32, k_idx: u32, row: u32, c_idx: u32) {
+  let b_col = tile_base + row;
+  let col = c_idx * 16u;
+  for (var i = 0u; i < 16u; i = i + 1u) {
+    let k = k_idx + col + i;
+{% if GENERAL %}
+{% if TAIL %}
+    let b_safe = min(b_col, N - 1u);
+    tile_B[row * TILE_K + col + i] = {{ operandScalar }}(b[b_base + k * B_K_STRIDE + b_safe * B_N_STRIDE]);
+{% else %}
+{% if operandScalar == "f16" %}
+    tile_B[row * TILE_K + col + i] = f16(b[b_base + k * B_K_STRIDE + b_col * B_N_STRIDE]);
+{% else %}
+    tile_B[row * TILE_K + col + i] = f32(b[b_base + k * B_K_STRIDE + b_col * B_N_STRIDE]);
+{% endif %}
+{% endif %}
+{% else %}
+{% set bIndex = "b_col * K + k" if bTransposed is defined and bTransposed else "k * N + b_col" %}
+    tile_B[row * TILE_K + col + i] = {{ operandScalar }}(b[b_base + {{ bIndex }}]);
+{% endif %}
+  }
+}
+{% if GENERAL and TAIL %}
+
+fn loadSHMBKTail(b_base: u32, tile_base: u32, k_idx: u32, row: u32, c_idx: u32) {
+  let b_col = min(tile_base + row, N - 1u);
+  let col = c_idx * 16u;
+  for (var i = 0u; i < 16u; i = i + 1u) {
+    let k = k_idx + col + i;
+    if (k < K) {
+      tile_B[row * TILE_K + col + i] = {{ operandScalar }}(b[b_base + k * B_K_STRIDE + b_col * B_N_STRIDE]);
+    } else {
+      tile_B[row * TILE_K + col + i] = {{ operandScalar }}(0);
+    }
+  }
+}
+
+{% endif %}
+{% set needsColBase = hasBias or (GENERAL and TAIL) %}
+fn storeOutput(offset: u32{% if needsColBase %}, col_base: u32{% endif %}, row: u32, col: u32, src_slot: u32, row_limit: i32) {
+  if (row_limit > 0 && row < u32(row_limit)) {
+    let col2 = col + 1u;
+{% if GENERAL %}
+{% for block in range(4) %}
+{% if TAIL %}
+    if (col_base + col + {{ block * 8 }}u < N) {
+{% endif %}
+      {{ OUT }}[offset + row * N + col + {{ block * 8 }}u] = {{ OUT_SCALAR }}(
+        ALPHA * scratch[src_slot][{{ block }}][row * 8u + col]
+      );
+{% if TAIL %}
+    }
+    if (col_base + col2 + {{ block * 8 }}u < N) {
+{% endif %}
+      {{ OUT }}[offset + row * N + col2 + {{ block * 8 }}u] = {{ OUT_SCALAR }}(
+        ALPHA * scratch[src_slot][{{ block }}][row * 8u + col2]
+      );
+{% if TAIL %}
+    }
+{% endif %}
+{% endfor %}
+{% else %}
+{% if hasBias %}
+    {{ OUT }}[offset + row * N + col]       = {{ T }}(scratch[src_slot][0][row * 8u + col] + {{ accScalar }}(bias[col_base + col]));
+    {{ OUT }}[offset + row * N + col + 8u]  = {{ T }}(scratch[src_slot][1][row * 8u + col] + {{ accScalar }}(bias[col_base + col + 8u]));
+    {{ OUT }}[offset + row * N + col + 16u] = {{ T }}(scratch[src_slot][2][row * 8u + col] + {{ accScalar }}(bias[col_base + col + 16u]));
+    {{ OUT }}[offset + row * N + col + 24u] = {{ T }}(scratch[src_slot][3][row * 8u + col] + {{ accScalar }}(bias[col_base + col + 24u]));
+
+    {{ OUT }}[offset + row * N + col2]       = {{ T }}(scratch[src_slot][0][row * 8u + col2] + {{ accScalar }}(bias[col_base + col2]));
+    {{ OUT }}[offset + row * N + col2 + 8u]  = {{ T }}(scratch[src_slot][1][row * 8u + col2] + {{ accScalar }}(bias[col_base + col2 + 8u]));
+    {{ OUT }}[offset + row * N + col2 + 16u] = {{ T }}(scratch[src_slot][2][row * 8u + col2] + {{ accScalar }}(bias[col_base + col2 + 16u]));
+    {{ OUT }}[offset + row * N + col2 + 24u] = {{ T }}(scratch[src_slot][3][row * 8u + col2] + {{ accScalar }}(bias[col_base + col2 + 24u]));
+{% else %}
+    {{ OUT }}[offset + row * N + col]       = {{ T }}(scratch[src_slot][0][row * 8u + col]);
+    {{ OUT }}[offset + row * N + col + 8u]  = {{ T }}(scratch[src_slot][1][row * 8u + col]);
+    {{ OUT }}[offset + row * N + col + 16u] = {{ T }}(scratch[src_slot][2][row * 8u + col]);
+    {{ OUT }}[offset + row * N + col + 24u] = {{ T }}(scratch[src_slot][3][row * 8u + col]);
+
+    {{ OUT }}[offset + row * N + col2]       = {{ T }}(scratch[src_slot][0][row * 8u + col2]);
+    {{ OUT }}[offset + row * N + col2 + 8u]  = {{ T }}(scratch[src_slot][1][row * 8u + col2]);
+    {{ OUT }}[offset + row * N + col2 + 16u] = {{ T }}(scratch[src_slot][2][row * 8u + col2]);
+    {{ OUT }}[offset + row * N + col2 + 24u] = {{ T }}(scratch[src_slot][3][row * 8u + col2]);
+{% endif %}
+{% endif %}
+  }
+}
+
+@compute @workgroup_size(128, 1, 1){{ " @subgroup_size(32)" if pinSubgroupSize32 else "" }}
+fn main(
+  @builtin(workgroup_id) workgroup_id: vec3<u32>,
+  @builtin(num_workgroups) num_wg: vec3<u32>,
+  @builtin(local_invocation_index) local_idx: u32,
+  @builtin(subgroup_invocation_id) sg_id: u32,
+  @builtin(subgroup_size) sg_size: u32
+) {
+  let b_global_base = workgroup_id.x * TILE_COLS;
+
+  let subtile_id = local_idx / sg_size;
+  let subtile_idx = subtile_id / 2u;
+  let subtile_idy = subtile_id % 2u;
+  let base_A = subtile_idy * SUB_ROWS;
+  let base_B = subtile_idx * SUB_COLS;
+
+  // Grid-stride over both the M-tile (y) and batch (z) axes so the dispatch stays
+  // <= maxComputeWorkgroupsPerDimension per dimension even when ceil(M/TILE_ROWS) or BATCH_COUNT exceed the
+  // limit. workgroup_size.z = 1 so num_wg.z is the batch dispatch stride, and
+  // num_wg.y * TILE_ROWS is the row-tile dispatch stride. The loop bounds (M and
+  // BATCH_COUNT are compile-time / uniform; num_wg and workgroup_id are uniform)
+  // are workgroup-uniform, so the trailing workgroupBarrier()s and the subgroup
+  // matrix operations stay reconverged. When neither axis is clamped,
+  // num_wg.y * TILE_ROWS > M and num_wg.z > BATCH_COUNT, so each loop executes
+  // exactly once at workgroup_id.y/workgroup_id.z.
+  let row_tile_stride = num_wg.y * TILE_ROWS;
+  for (var a_global_base = workgroup_id.y * TILE_ROWS; a_global_base < M; a_global_base += row_tile_stride) {
+{% if SPLIT_K > 1 %}
+  // Split-K maps z to (batch, K segment), multiplying occupancy for narrow
+  // matrices while every segment still owns a disjoint contiguous K range.
+  for (var batch_split = workgroup_id.z; batch_split < BATCH_COUNT * SPLIT_K; batch_split += num_wg.z) {
+    let batch = batch_split / SPLIT_K;
+    let split_id = batch_split - batch * SPLIT_K;
+{% else %}
+  // workgroup_size.z = 1, so num_wg.z is the dispatch stride over the batch axis.
+  for (var batch = workgroup_id.z; batch < BATCH_COUNT; batch += num_wg.z) {
+{% endif %}
+{% if GENERAL %}
+{% set hasBatchCoord = namespace(value=false) %}
+{% for i in range(batchRank) %}
+{% set axis = batchRank - 1 - i %}
+{% set aAxis = axis - (batchRank - aBatchLen) %}
+{% set bAxis = axis - (batchRank - bBatchLen) %}
+{% set aDim = source.aShape[aAxis] %}
+{% set bDim = source.bShape[bAxis] if bAxis >= 0 else 1 %}
+{% if aDim > 1 or bDim > 1 %}{% set hasBatchCoord.value = true %}{% endif %}
+{% endfor %}
+    // Right-aligned broadcast offsets, decomposed from the flattened output batch.
+{% if hasBatchCoord.value %}
+    var zTmp = batch;
+{% endif %}
+    var a_base: u32 = 0u;
+    var b_base: u32 = 0u;
+{% for i in range(batchRank) %}
+{% set axis = batchRank - 1 - i %}
+{% set aAxis = axis - (batchRank - aBatchLen) %}
+{% set bAxis = axis - (batchRank - bBatchLen) %}
+{% set aDim = source.aShape[aAxis] %}
+{% set bDim = source.bShape[bAxis] if bAxis >= 0 else 1 %}
+{% set outDim = aDim if aDim >= bDim else bDim %}
+{% set aStride = namespace(v=1) %}
+{% if aDim != 1 %}{% for j in range(aAxis + 1, aR) %}{% set aStride.v = aStride.v * source.aShape[j] %}{% endfor %}{% else %}{% set aStride.v = 0 %}{% endif %}
+{% set bStride = namespace(v=1) %}
+{% if bAxis >= 0 and bDim != 1 %}{% for j in range(bAxis + 1, bR) %}{% set bStride.v = bStride.v * source.bShape[j] %}{% endfor %}{% else %}{% set bStride.v = 0 %}{% endif %}
+{% if outDim > 1 %}
+    let c{{ axis }} = zTmp % {{ outDim }}u;
+    zTmp = zTmp / {{ outDim }}u;
+{% if aStride.v != 0 %}    a_base = a_base + c{{ axis }} * {{ aStride.v }}u;
+{% endif %}
+{% if bStride.v != 0 %}    b_base = b_base + c{{ axis }} * {{ bStride.v }}u;
+{% endif %}
+{% endif %}
+{% endfor %}
+{% if SPLIT_K > 1 %}
+    let c_base = (batch * SPLIT_K + split_id) * C_BATCH_STRIDE;
+{% else %}
+    let c_base = batch * C_BATCH_STRIDE;
+{% endif %}
+{% else %}
+    let a_base = batch * A_BATCH_STRIDE;
+    let b_base = batch * B_BATCH_STRIDE;
+    let c_base = batch * C_BATCH_STRIDE;
+{% endif %}
+
+    var matC00: subgroup_matrix_result<{{ accScalar }}, 8, 8>;
+    var matC01: subgroup_matrix_result<{{ accScalar }}, 8, 8>;
+    var matC02: subgroup_matrix_result<{{ accScalar }}, 8, 8>;
+    var matC03: subgroup_matrix_result<{{ accScalar }}, 8, 8>;
+    var matC10: subgroup_matrix_result<{{ accScalar }}, 8, 8>;
+    var matC11: subgroup_matrix_result<{{ accScalar }}, 8, 8>;
+    var matC12: subgroup_matrix_result<{{ accScalar }}, 8, 8>;
+    var matC13: subgroup_matrix_result<{{ accScalar }}, 8, 8>;
+
+{% if SPLIT_K > 1 %}
+    let k_begin = split_id * K_PER_SPLIT;
+    let k_end = min(k_begin + K_PER_SPLIT, K);
+    for (var kidx = k_begin; kidx < k_end; kidx = kidx + TILE_K) {
+{% else %}
+    for (var kidx = 0u; kidx < {% if GENERAL and TAIL %}K_FULL{% else %}K{% endif %}; kidx = kidx + TILE_K) {
+{% endif %}
+      loadSHMA(a_base, a_global_base, kidx, local_idx / 4u, local_idx % 4u);
+      loadSHMB(b_base, b_global_base, kidx, local_idx / 2u, local_idx % 2u);
+      workgroupBarrier();
+
+      for (var step = 0u; step < TILE_K; step = step + 8u) {
+        let matrix_a_offset = subtile_idy * SUB_ROWS * TILE_K + step;
+      var matA0: subgroup_matrix_left<{{ operandScalar }}, 8, 8> = subgroupMatrixLoad<subgroup_matrix_left<{{ operandScalar }}, 8, 8>, row_major>(&tile_A, matrix_a_offset, TILE_K);
+      var matA1: subgroup_matrix_left<{{ operandScalar }}, 8, 8> = subgroupMatrixLoad<subgroup_matrix_left<{{ operandScalar }}, 8, 8>, row_major>(&tile_A, matrix_a_offset + 8u * TILE_K, TILE_K);
+
+      let matrix_b_offset = subtile_idx * SUB_COLS * TILE_K + step;
+      var matB0: subgroup_matrix_right<{{ operandScalar }}, 8, 8> = subgroupMatrixLoad<subgroup_matrix_right<{{ operandScalar }}, 8, 8>, col_major>(&tile_B, matrix_b_offset, TILE_K);
+      var matB1: subgroup_matrix_right<{{ operandScalar }}, 8, 8> = subgroupMatrixLoad<subgroup_matrix_right<{{ operandScalar }}, 8, 8>, col_major>(&tile_B, matrix_b_offset + 8u * TILE_K, TILE_K);
+      var matB2: subgroup_matrix_right<{{ operandScalar }}, 8, 8> = subgroupMatrixLoad<subgroup_matrix_right<{{ operandScalar }}, 8, 8>, col_major>(&tile_B, matrix_b_offset + 16u * TILE_K, TILE_K);
+      var matB3: subgroup_matrix_right<{{ operandScalar }}, 8, 8> = subgroupMatrixLoad<subgroup_matrix_right<{{ operandScalar }}, 8, 8>, col_major>(&tile_B, matrix_b_offset + 24u * TILE_K, TILE_K);
+
+      matC00 = subgroupMatrixMultiplyAccumulate(matA0, matB0, matC00);
+      matC01 = subgroupMatrixMultiplyAccumulate(matA0, matB1, matC01);
+      matC02 = subgroupMatrixMultiplyAccumulate(matA0, matB2, matC02);
+      matC03 = subgroupMatrixMultiplyAccumulate(matA0, matB3, matC03);
+      matC10 = subgroupMatrixMultiplyAccumulate(matA1, matB0, matC10);
+      matC11 = subgroupMatrixMultiplyAccumulate(matA1, matB1, matC11);
+      matC12 = subgroupMatrixMultiplyAccumulate(matA1, matB2, matC12);
+      matC13 = subgroupMatrixMultiplyAccumulate(matA1, matB3, matC13);
+      }
+      workgroupBarrier();
+    }
+{% if GENERAL and TAIL %}
+    if (K_FULL < K) {
+      loadSHMAKTail(a_base, a_global_base, K_FULL, local_idx / 4u, local_idx % 4u);
+      loadSHMBKTail(b_base, b_global_base, K_FULL, local_idx / 2u, local_idx % 2u);
+      workgroupBarrier();
+
+      for (var step = 0u; step < TILE_K; step = step + 8u) {
+        let matrix_a_offset = subtile_idy * SUB_ROWS * TILE_K + step;
+      var matA0: subgroup_matrix_left<{{ operandScalar }}, 8, 8> = subgroupMatrixLoad<subgroup_matrix_left<{{ operandScalar }}, 8, 8>, row_major>(&tile_A, matrix_a_offset, TILE_K);
+      var matA1: subgroup_matrix_left<{{ operandScalar }}, 8, 8> = subgroupMatrixLoad<subgroup_matrix_left<{{ operandScalar }}, 8, 8>, row_major>(&tile_A, matrix_a_offset + 8u * TILE_K, TILE_K);
+
+      let matrix_b_offset = subtile_idx * SUB_COLS * TILE_K + step;
+      var matB0: subgroup_matrix_right<{{ operandScalar }}, 8, 8> = subgroupMatrixLoad<subgroup_matrix_right<{{ operandScalar }}, 8, 8>, col_major>(&tile_B, matrix_b_offset, TILE_K);
+      var matB1: subgroup_matrix_right<{{ operandScalar }}, 8, 8> = subgroupMatrixLoad<subgroup_matrix_right<{{ operandScalar }}, 8, 8>, col_major>(&tile_B, matrix_b_offset + 8u * TILE_K, TILE_K);
+      var matB2: subgroup_matrix_right<{{ operandScalar }}, 8, 8> = subgroupMatrixLoad<subgroup_matrix_right<{{ operandScalar }}, 8, 8>, col_major>(&tile_B, matrix_b_offset + 16u * TILE_K, TILE_K);
+      var matB3: subgroup_matrix_right<{{ operandScalar }}, 8, 8> = subgroupMatrixLoad<subgroup_matrix_right<{{ operandScalar }}, 8, 8>, col_major>(&tile_B, matrix_b_offset + 24u * TILE_K, TILE_K);
+
+      matC00 = subgroupMatrixMultiplyAccumulate(matA0, matB0, matC00);
+      matC01 = subgroupMatrixMultiplyAccumulate(matA0, matB1, matC01);
+      matC02 = subgroupMatrixMultiplyAccumulate(matA0, matB2, matC02);
+      matC03 = subgroupMatrixMultiplyAccumulate(matA0, matB3, matC03);
+      matC10 = subgroupMatrixMultiplyAccumulate(matA1, matB0, matC10);
+      matC11 = subgroupMatrixMultiplyAccumulate(matA1, matB1, matC11);
+      matC12 = subgroupMatrixMultiplyAccumulate(matA1, matB2, matC12);
+      matC13 = subgroupMatrixMultiplyAccumulate(matA1, matB3, matC13);
+      }
+      workgroupBarrier();
+    }
+
+{% endif %}
+    // The four scratch banks are reused across the two row-groups, and each is written
+    // by a collective subgroupMatrixStore then read CROSS-LANE by storeOutput. Barriers
+    // give the reads visibility of the store AND stop the second row-group's store from
+    // clobbering the first's still-in-flight readback when a partial final M-tile
+    // diverges storeOutput's guard. Without both barriers the last valid row can be corrupted.
+    subgroupMatrixStore<row_major>(&scratch[subtile_id][0], 0u, matC00, 8u);
+    subgroupMatrixStore<row_major>(&scratch[subtile_id][1], 0u, matC01, 8u);
+    subgroupMatrixStore<row_major>(&scratch[subtile_id][2], 0u, matC02, 8u);
+    subgroupMatrixStore<row_major>(&scratch[subtile_id][3], 0u, matC03, 8u);
+    workgroupBarrier();
+    let row = sg_id / 4u;
+    let col = (sg_id % 4u) * 2u;
+    let col_base = b_global_base + base_B;
+    var matrix_c_offset = c_base + (a_global_base + base_A) * N + col_base;
+    var row_limit = i32(M) - i32(a_global_base + base_A);
+    storeOutput(matrix_c_offset{% if needsColBase %}, col_base{% endif %}, row, col, subtile_id, row_limit);
+    workgroupBarrier();
+
+    subgroupMatrixStore<row_major>(&scratch[subtile_id][0], 0u, matC10, 8u);
+    subgroupMatrixStore<row_major>(&scratch[subtile_id][1], 0u, matC11, 8u);
+    subgroupMatrixStore<row_major>(&scratch[subtile_id][2], 0u, matC12, 8u);
+    subgroupMatrixStore<row_major>(&scratch[subtile_id][3], 0u, matC13, 8u);
+    workgroupBarrier();
+    matrix_c_offset = matrix_c_offset + 8u * N;
+    row_limit = i32(M) - i32(a_global_base + base_A + 8u);
+    storeOutput(matrix_c_offset{% if needsColBase %}, col_base{% endif %}, row, col, subtile_id, row_limit);
+
+    // Re-stage workgroup tiles/scratch before the next batch iteration reuses them.
+    workgroupBarrier();
+  }
+  // Re-stage workgroup tiles/scratch before the next M-tile iteration reuses them.
+  // The loop bound is workgroup-uniform (M is a compile-time const, num_wg.y and
+  // workgroup_id.y are uniform), so every invocation reaches this barrier together.
+  workgroupBarrier();
+  }
+}

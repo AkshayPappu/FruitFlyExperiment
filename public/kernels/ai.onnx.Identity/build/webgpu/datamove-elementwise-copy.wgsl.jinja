@@ -1,0 +1,20 @@
+{% if usesF16 %}
+enable f16;
+{% endif %}
+{{ env.wgsl.resourceDeclarations }}
+
+const WG: u32 = {{ tunables.WORKGROUP_SIZE }}u;
+
+@compute @workgroup_size({{ tunables.WORKGROUP_SIZE }})
+fn main(
+  @builtin(global_invocation_id) gid: vec3<u32>,
+  @builtin(num_workgroups) nwg: vec3<u32>
+) {
+  // Grid-stride loop: the dispatch is clamped to the maxComputeWorkgroupsPerDimension
+  // workgroups-per-dimension limit, so a thread may copy more than one
+  // element for very large tensors.
+  let stride = nwg.x * WG;
+  for (var i = gid.x; i < params.count; i += stride) {
+    y[i] = x[i];
+  }
+}

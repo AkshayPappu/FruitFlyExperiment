@@ -1,0 +1,34 @@
+{% if T == "f16" %}
+enable f16;
+{% endif %}
+{{ env.wgsl.resourceDeclarations }}
+@compute @workgroup_size({{ fallbackTile }}, {{ fallbackTile }})
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+  // 2D-folded M-tile (row) index: gid.z carries the high bits of the row past
+  // the per-dimension dispatch limit. This reduces to gid.y when nwg.z == 1;
+  // the row guard drops the over-dispatched tail.
+  let row = gid.y + gid.z * nwg.y * {{ fallbackTile }}u;
+  if (row >= params.M) {
+    return;
+  }
+  // The x dispatch is clamped to the device limit. Grid-striding columns keeps
+  // arbitrarily wide outputs covered without encoding an adapter-specific cap.
+  let col_stride = nwg.x * {{ fallbackTile }}u;
+  for (var col = gid.x; col < params.N; col += col_stride) {
+{% if T == "i32" or T == "u32" %}
+  // Integer MatMul accumulates in the integer type. Widening through f32, with
+  // only 24 mantissa bits, would round values above 2^24.
+  var acc: {{ T }} = {{ T }}(0);
+  for (var k = 0u; k < params.K; k = k + 1u) {
+    acc = acc + a[row * params.K + k] * b[k * params.N + col];
+  }
+  y[row * params.N + col] = acc;
+{% else %}
+  var acc = 0.0;
+  for (var k = 0u; k < params.K; k = k + 1u) {
+    acc = acc + f32(a[row * params.K + k]) * f32(b[k * params.N + col]);
+  }
+  y[row * params.N + col] = {{ T }}(acc);
+{% endif %}
+  }
+}
