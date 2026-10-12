@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { CSS3DRenderer, CSS3DObject } from 'three/addons/renderers/CSS3DRenderer.js';
 import { parseBinarySTL, transformVertices } from './body/stl.js';
 import { Gait } from './gait.js';
 import { requestBytes } from './data-loader.js';
@@ -17,12 +18,33 @@ import {
 import {
   CAMERA_FOV,
   CAMERA_OFFSETS,
+  BAND_FOCUS,
   cameraFit,
   cameraPullback,
   cameraTarget,
 } from './camera-config.js';
 const clamp = THREE.MathUtils.clamp;
 const POSE_FIELDS = Object.keys(restPose()).filter((key) => key !== 'behavior');
+// The TV stands behind the fly (world offset from the fly), turned to face the camera and raised
+// on a stand so its screen sits above the fly in the band view: the screen is drawn over the scene.
+const TV_SIZE = [9, 5.0625];
+const TV_OFFSET = [0, 3];
+const TV_LIFT = 2;
+const TV_YAW = Math.atan2(CAMERA_OFFSETS.side[0], -CAMERA_OFFSETS.side[1]);
+const PAD_COLORS = [0xff7a59, 0xf2c14e, 0x5ad1a8, 0x6ea8ff];
+const PAD_ANGLES = [0.62, 0.21, -0.21, -0.62];
+const PAD_RADIUS = 1.9;
+const PAD_POSITIONS = PAD_ANGLES.map((a) => [PAD_RADIUS * Math.cos(a), PAD_RADIUS * Math.sin(a)]);
+// Foot heights (level frame, fly origin): touching a pad top, and hovering between strikes.
+const FOOT_CONTACT_Z = 0.25;
+const FOOT_HOVER_Z = 0.45;
+const TAP_MS = 180;
+// When one leg has two pads to strike in a step, the second follows this much later.
+const TAP_GAP_MS = 90;
+const BAND_TAU = 0.25;
+/** Pad dip over a tap, peaking when the foot lands mid-tap. */
+const tapCurve = (age) => (age >= 0 && age < TAP_MS ? Math.sin((Math.PI * age) / TAP_MS) : 0);
+const lerp3 = (a, b, t) => a.map((v, k) => v + (b[k] - v) * t);
 /** Weld duplicate vertices before computing smooth normals. */
 function geometryFor(raw, scale, mirror) {
   const positions = transformVertices(raw, scale, mirror);
@@ -207,11 +229,22 @@ export class FlyScene {
     pg.setDrawRange(0, 0);
     this.trail = new THREE.Line(
       pg,
-      new THREE.LineBasicMaterial({ color: 0x7ee2d5, transparent: true, opacity: 0.22 }),
+      new THREE.LineBasicMaterial({
+        color: 0x7ee2d5,
+        transparent: true,
+        opacity: 0.22,
+      }),
     );
     this.scene.add(this.trail);
     this.observer = new ResizeObserver(() => this.resize());
     this.observer.observe(canvas);
+    this.cssScene = new THREE.Scene();
+    this.cssRenderer = new CSS3DRenderer();
+    this.cssRenderer.domElement.className = 'tv-layer';
+    canvas.parentElement.appendChild(this.cssRenderer.domElement);
+    this._buildTV();
+    this._buildBand();
+    this.resize();
     this.setCamera('side');
     this.render = this.render.bind(this);
     this.frame = requestAnimationFrame(this.render);
@@ -277,6 +310,194 @@ export class FlyScene {
     this.lastGaitTime = undefined;
     this.applyPose(this.pose);
   }
+
+  _buildTV() {
+    const w = TV_SIZE[0],
+      h = TV_SIZE[1],
+      depth = 0.14;
+    const plastic = new THREE.MeshStandardMaterial({
+      color: 0x1a1d24,
+      roughness: 0.45,
+      metalness: 0.25,
+    });
+    const bezel = new THREE.Mesh(new THREE.BoxGeometry(w + 0.2, depth, h + 0.2), plastic);
+    bezel.castShadow = true;
+    bezel.receiveShadow = true;
+    const neck = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.2, TV_LIFT), plastic);
+    neck.position.z = -(h + TV_LIFT) / 2;
+    neck.castShadow = true;
+    const stand = new THREE.Mesh(new THREE.BoxGeometry(2.4, 0.9, 0.1), plastic);
+    stand.position.z = -(h / 2 + TV_LIFT) + 0.05;
+    stand.receiveShadow = true;
+    this.tv = new THREE.Group();
+    this.tv.add(bezel, neck, stand);
+    this.tv.position.set(TV_OFFSET[0], TV_OFFSET[1], h / 2 + TV_LIFT);
+    this.tv.rotation.z = TV_YAW;
+    this.scene.add(this.tv);
+
+    this.tvAnchor = new THREE.Object3D();
+    this.tvAnchor.position.set(0, -depth / 2 - 0.01, 0);
+    this.tvAnchor.rotation.x = Math.PI / 2;
+    this.tv.add(this.tvAnchor);
+
+    const host = document.createElement('div');
+    host.style.width = '640px';
+    host.style.height = '360px';
+    host.style.border = '0';
+    host.style.background = '#0b0d12';
+    host.style.overflow = 'hidden';
+    const mount = document.createElement('div');
+    mount.id = 'yt-tv-frame';
+    mount.style.width = '640px';
+    mount.style.height = '360px';
+    host.appendChild(mount);
+    this.tvScreen = new CSS3DObject(host);
+    host.style.pointerEvents = 'none';
+    const s = w / 640;
+    this.tvScreen.scale.set(s, s, s);
+    this.cssScene.add(this.tvScreen);
+    this.tv.visible = false;
+    this.tvScreen.visible = false;
+  }
+
+  _buildBand() {
+    this.band = false;
+    this.bandBlend = 0;
+    this.bandGroup = new THREE.Group();
+    this.bandGroup.visible = false;
+    const rimMaterial = new THREE.MeshStandardMaterial({
+      color: 0x22262e,
+      roughness: 0.5,
+      metalness: 0.4,
+    });
+    this.pads = PAD_COLORS.map((color, i) => {
+      const holder = new THREE.Group();
+      holder.position.set(...PAD_POSITIONS[i], 0);
+      const rim = new THREE.Mesh(new THREE.CylinderGeometry(0.36, 0.4, 0.12, 40), rimMaterial);
+      rim.rotation.x = Math.PI / 2;
+      rim.position.z = 0.06;
+      rim.castShadow = rim.receiveShadow = true;
+      const material = new THREE.MeshStandardMaterial({
+        color,
+        emissive: color,
+        emissiveIntensity: 0.1,
+        roughness: 0.35,
+        metalness: 0.1,
+      });
+      const top = new THREE.Mesh(new THREE.CylinderGeometry(0.3, 0.3, 0.05, 40), material);
+      top.rotation.x = Math.PI / 2;
+      top.position.z = 0.135;
+      top.castShadow = top.receiveShadow = true;
+      holder.add(rim, top);
+      this.bandGroup.add(holder);
+      return { top, material, level: 0, target: 0, hitAt: -Infinity };
+    });
+    // Left front leg plays pads 0-1, right front leg pads 2-3; each hovers between its pair.
+    this.taps = [[], []];
+    this.feet = [null, null];
+    this.footRest = [0, 2].map((i) => [
+      (PAD_POSITIONS[i][0] + PAD_POSITIONS[i + 1][0]) / 2,
+      (PAD_POSITIONS[i][1] + PAD_POSITIONS[i + 1][1]) / 2,
+      FOOT_HOVER_Z,
+    ]);
+    this.scene.add(this.bandGroup);
+  }
+
+  /** Band mode: show the pads and hold the fly in a forward-leaning playing stance. */
+  setBand(on) {
+    const was = this.band;
+    this.band = Boolean(on);
+    if (this.band) this.bandGroup.visible = true;
+    if (!this.band) for (const pad of this.pads) pad.target = 0;
+    if (this.band !== was) this.setCamera(this.band ? 'band' : 'side');
+  }
+
+  setPadLevel(i, level) {
+    const pad = this.pads?.[i];
+    if (pad) pad.target = clamp(level, 0, 1);
+  }
+
+  /** A press: the front leg on that side strikes this pad, which dips as the foot lands. */
+  hitPad(i) {
+    const pad = this.pads?.[i];
+    if (!pad) return;
+    const now = performance.now();
+    const queue = this.taps[i < 2 ? 0 : 1];
+    const last = queue[queue.length - 1];
+    const at = last ? Math.max(now, last.at + TAP_GAP_MS) : now;
+    queue.push({ pad: i, at, from: null });
+    pad.hitAt = at;
+  }
+
+  /** Foot target for one front leg in the level pad frame: hover, or mid-strike. */
+  _footTarget(side, now) {
+    const queue = this.taps[side];
+    while (queue.length > 1 && queue[1].at <= now) queue.shift();
+    const rest = this.footRest[side];
+    let target = rest;
+    const tap = queue[0];
+    if (tap && tap.at <= now) {
+      const u = (now - tap.at) / TAP_MS;
+      if (u >= 1) queue.shift();
+      else {
+        // Leave from wherever the foot was, land on the pad mid-tap, return to hover.
+        tap.from ??= this.feet[side] ?? rest;
+        const base = lerp3(tap.from, rest, u);
+        target = lerp3(base, [...PAD_POSITIONS[tap.pad], FOOT_CONTACT_Z], Math.sin(Math.PI * u));
+        target[2] += 0.2 * Math.max(0, Math.sin(2 * Math.PI * u));
+      }
+    }
+    this.feet[side] = target;
+    return target;
+  }
+
+  _bandPose(p, now) {
+    const dt = this.lastBandRender ? clamp((now - this.lastBandRender) / 1000, 0, 0.05) : 0;
+    this.lastBandRender = now;
+    this.bandBlend += ((this.band ? 1 : 0) - this.bandBlend) * (1 - Math.exp(-dt / BAND_TAU));
+    for (const pad of this.pads) {
+      pad.level += (pad.target - pad.level) * (1 - Math.exp(-dt / 0.06));
+      const dip = tapCurve(now - pad.hitAt);
+      pad.material.emissiveIntensity = 0.1 + 1.8 * pad.level + 0.8 * dip;
+      pad.top.position.z = 0.135 - 0.04 * dip;
+    }
+    if (!this.band && this.bandBlend < 0.002) {
+      this.bandBlend = 0;
+      this.bandGroup.visible = false;
+      return p;
+    }
+    this.bandGroup.position.set(p.z, p.x, 0);
+    this.bandGroup.rotation.set(0, 0, p.yaw);
+    const w = this.bandBlend;
+    const pitch = p.pitch + 0.08 * w;
+    // The legs are solved in the body frame, which pitches with the fly.
+    const c = Math.cos(pitch),
+      s = Math.sin(pitch);
+    const toBody = ([x, y, z]) => [c * x - s * (z - p.y), y, s * x + c * (z - p.y)];
+    return {
+      ...p,
+      pitch,
+      time: now / 1000,
+      bandWeight: w,
+      bandFeet: [0, 1].map((side) => toBody(this._footTarget(side, now))),
+    };
+  }
+
+  setTVVideo(videoId) {
+    if (!this.tvScreen) return;
+    this.tvOn = Boolean(videoId);
+    this._showTV();
+    if (this.tvOn) return;
+    const frame = this.tvScreen.element.querySelector('iframe') || this.tvScreen.element;
+    if (frame.src) frame.src = 'about:blank';
+  }
+
+  /** The screen is drawn over the scene, so it is only framed clear of the fly in the band view. */
+  _showTV() {
+    if (!this.tvScreen) return;
+    this.tv.visible = this.tvScreen.visible = Boolean(this.tvOn) && this.cameraView === 'band';
+  }
+
   setCamera(view) {
     const damping = this.controls.enableDamping;
     this.controls.enableDamping = false;
@@ -286,8 +507,10 @@ export class FlyScene {
     this.trackHeading = view === 'follow';
     this.cameraYaw = this.pose.yaw;
     this.fitScale = cameraFit(view, this.camera.aspect);
+    this.controls.maxDistance = 24 * this.fitScale;
     this.pullback = cameraPullback(this.pose);
     this.controls.target.fromArray(cameraTarget(this.pose));
+    if (view === 'band') this.controls.target.add(new THREE.Vector3(...BAND_FOCUS));
     this.camera.up.set(0, 0, 1);
     this.camera.position
       .copy(this.controls.target)
@@ -297,6 +520,7 @@ export class FlyScene {
           .multiplyScalar(this.fitScale * this.pullback),
       );
     this.controls.update();
+    this._showTV();
     this.onCameraChange?.(view);
   }
   setDepthOfField(enabled) {
@@ -327,6 +551,13 @@ export class FlyScene {
       .add(this.controls.target);
     this.fitScale = fit;
     this.controls.update();
+    if (this.cssRenderer) {
+      this.cssRenderer.setSize(r.width, r.height);
+      const layer = this.cssRenderer.domElement;
+      layer.style.position = 'absolute';
+      layer.style.inset = '0';
+      layer.style.pointerEvents = 'none';
+    }
   }
   update(pose) {
     const now = performance.now();
@@ -387,6 +618,8 @@ export class FlyScene {
     }
     this.floor.position.x = p.z;
     this.floor.position.y = p.x;
+    this.tv.position.x = p.z + TV_OFFSET[0];
+    this.tv.position.y = p.x + TV_OFFSET[1];
     this.texture.offset.set(p.z / 2, p.x / 2);
     this.key.position.set(p.z + 2, p.x - 4, 7);
     this.key.target.position.set(p.z, p.x, 0);
@@ -395,10 +628,11 @@ export class FlyScene {
     if (this.disposed) return;
     this.frame = requestAnimationFrame(this.render);
     if (document.hidden) return;
-    const t = clamp((now - this.arrival) / this.interval, 0, 1),
-      p = {};
+    const t = clamp((now - this.arrival) / this.interval, 0, 1);
+    let p = {};
     for (const key of POSE_FIELDS)
       p[key] = this.previous[key] + (this.next[key] - this.previous[key]) * t;
+    if (this.band || this.bandBlend > 0) p = this._bandPose(p, now);
     this.applyPose(p);
     if (Math.hypot(p.x - (this.lastPathX ?? 0), p.z - (this.lastPathZ ?? 0)) > 0.08) {
       this.lastPathX = p.x;
@@ -437,6 +671,12 @@ export class FlyScene {
       this.dof.uniforms.focus.value = Math.max(this.camera.near, -this.focusPoint.z);
     }
     this.composer.render();
+    if (this.cssRenderer && this.tvAnchor && this.tvScreen) {
+      this.tvAnchor.updateWorldMatrix(true, false);
+      this.tvScreen.position.setFromMatrixPosition(this.tvAnchor.matrixWorld);
+      this.tvScreen.quaternion.setFromRotationMatrix(this.tvAnchor.matrixWorld);
+      this.cssRenderer.render(this.cssScene, this.camera);
+    }
   }
   reset() {
     const zero = restPose();
@@ -471,5 +711,9 @@ export class FlyScene {
     for (const pass of this.composer.passes) pass.dispose();
     this.composer.dispose();
     this.renderer.dispose();
+    this.cssRenderer?.domElement.remove();
+    const host = this.tvScreen?.element;
+    const frame = host?.querySelector?.('iframe') || host;
+    if (frame?.src) frame.src = 'about:blank';
   }
 }

@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@huggingface/kernels": "0.0.1-preview.1",
+    "@rolldown/binding-win32-x64-msvc": "^1.2.13",
     "three": "0.180.0"
   },
   "devDependencies": {

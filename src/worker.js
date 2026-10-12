@@ -47,10 +47,18 @@ async function handle(m) {
   } else if (m.type === 'pulse') {
     if (m.replace) pulses.reset();
     pulses.add(m.indices, brain.tick, m.strength, m.profile ?? 'paint');
+  } else if (m.type === 'drive') {
+    pulses.setDrive(
+      Object.entries(m.rates ?? {}).map(([key, rate]) => ({
+        indices: groups[key] ?? [],
+        rate: Number(rate),
+      })),
+    );
   } else if (m.type === 'reset') {
     generation = m.generation;
     await brain.reset();
     pulses.reset();
+    pulses.setDrive([]);
     postMessage({ type: 'reset', generation });
   } else if (m.type === 'clear') {
     pulses.reset();

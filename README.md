@@ -17,6 +17,46 @@ A standalone fruit fly connectome demo: paint neurons, stimulate the network, an
 
 Simulated neural activity drives crafted walking, turning, and flight animations. The movements are illustrative, not validated predictions of fly behavior.
 
+It also has a **Fly Band** mode: upload a song and the simulated brain "plays" it. The song is split into four layers (Bass, Body, Vocals, Highs), each layer stimulates neurons that lead to one of four pads in front of the fly, and on playback you only hear the layers whose pads the fly's motor neurons actually pressed. A YouTube video of the song can play in sync on a TV behind the fly.
+
+## Fly Band
+
+### Using it
+
+1. Click **Download & start** and wait for the brain to load.
+2. Click **Band**, optionally paste a YouTube link for the TV, and drop in an audio file of the same song.
+3. A progress bar shows the brain working through the whole song. This takes a while, because the simulation runs slower than real time.
+4. Press **Play**. The song and the TV start together, the fly taps its pads, and only the layers it pressed are heard. **Original** plays the unfiltered song for comparison.
+
+The finished take is saved in the browser (`localStorage`, last 8 songs), so loading the same file again is instant.
+
+### How it works
+
+**Song analysis** (`src/song-analysis.js`). The file is decoded with Web Audio. The tempo is estimated from spectral flux and autocorrelation, and the song is divided into an 8th-note step grid. Each step gets an energy value for four frequency bands: Bass < 160 Hz, Body 160–800 Hz, Vocals 800–3,500 Hz, Highs > 3,500 Hz. A layer counts as "on" at a step when it stands out from its local median over ±16 steps, with a guard against near-silence.
+
+**Driving the brain** (`src/band.js`, `src/worker.js`). The brain runs in 10 ms batches of neural time, and each song step lasts 6 batches (60 ms). At the start of a step, every layer that is on stimulates its own neuron group with a steady input rate (the rate and duration were picked from strength/duration sweeps):
+
+| Layer  | Stimulated neurons                   | Drive            | Pad readout (descending neurons) |
+| ------ | ------------------------------------ | ---------------- | -------------------------------- |
+| Bass   | LC9 (walking input)                  | 220 Hz for 20 ms | Walking: DNp09, DNg100, DNg97    |
+| Body   | Left LC9 and DNa02 (turning)         | 80 Hz for 30 ms  | Turning: DNa02, DNa11, DNg13     |
+| Vocals | pC1 courtship neurons                | 220 Hz for 30 ms | Wing song: pIP10, pMP2           |
+| Highs  | Johnston's organ E neurons (antenna) | 50 Hz for 10 ms  | Grooming: DNg12                  |
+
+If a group isn't found in the data, the closest hearing group stands in for it (Johnston's organ A/B neurons or excitatory auditory relay neurons).
+
+**Reading the presses.** Over each 60 ms step, the firing rate of each pad's readout neurons is averaged. Above 20 Hz counts as a press. Activity spreads through the real MaleCNS wiring, so a layer is only pressed if its stimulus actually reaches those output neurons. The network adds latency, thresholds, crosstalk between pads, and lingering activity (grooming keeps going after its input stops).
+
+**"Learning" the song.** The whole song is run through the brain once, step by step, before it can be played, and the presses for every step are recorded as the take. Nothing in the network changes: there is no plasticity or reward, so this is a recording of the connectome's response, not learned behavior. The match score compares presses with the "on" targets and is balanced, so 50% is what guessing scores.
+
+**Playback** (`src/layer-player.js`). The decoded song plays through Linkwitz–Riley crossovers into four gain nodes. Each layer's gain is scheduled per step, open only where the fly pressed that pad. The pads glow and the front legs tap the pressed pads using per-pad foot targets and the existing leg inverse kinematics (`src/scene.js`, `src/gait.js`).
+
+**TV** (`src/tv.js`). A muted YouTube IFrame player is placed in the 3D scene as a CSS3D object behind and above the fly. Play starts the video at the same position as the audio and corrects drift greater than 0.35 s every few seconds. The video must start at the same moment as the audio file, or the two will be offset. Because the video layer is always drawn over the 3D scene, the TV is shown only in the band camera view, where it is framed clear of the fly.
+
+### Limitations
+
+The layer-to-neuron mapping, drive strengths and threshold are design choices tuned for the demo. Bass and Body stimulate neurons close to the motor output instead of the fly's auditory pathway, so a good match score mostly reflects that tuning. Treat Fly Band as an interactive visualization of signals flowing through real wiring, not a model of how flies hear or respond to music.
+
 ## Run
 
 Use Node.js 22.12 or newer.
@@ -46,6 +86,7 @@ Serve the `.bin.gz` and `.json.gz` files as stored bytes, without adding a `Cont
 - `src/worker.js`, `src/data-loader.js`: worker protocol, downloads, caching, and checksums.
 - `src/stimulus.js`, `src/controller.js`: painted inputs and neural-output-to-motion translation.
 - `src/scene.js`, `src/gait.js`, `src/body/`: rendering, stable leg IK, and measured skeleton.
+- `src/song-analysis.js`, `src/band.js`, `src/layer-player.js`, `src/tv.js`: Fly Band song analysis, brain-time song runner and saved takes, layered playback, and the YouTube TV.
 - `public/data/`, `public/body/`, `public/kernels/`: complete local runtime assets.
 - `public/model.json`: model parameters, provenance, and limitations.
 

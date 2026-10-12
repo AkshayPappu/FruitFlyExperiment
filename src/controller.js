@@ -1,4 +1,5 @@
 /** Engineered rate decoder. Body units: mm, seconds, radians; +yaw turns left. */
+import { CHANNELS } from './stimulus.js';
 const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
 const relax = (value, target, dt, tau) => value + (target - value) * (1 - Math.exp(-dt / tau));
 export function restPose() {
@@ -26,7 +27,7 @@ export class FlyController {
   }
   reset() {
     Object.assign(this, restPose());
-    this.rates = new Float64Array(6);
+    this.rates = new Float64Array(CHANNELS.length);
     this.vy = 0;
     this.distance = 0;
     this.mode = 'ground';
@@ -36,27 +37,40 @@ export class FlyController {
     this.cooldown = 0;
     this.escapeArmed = true;
     this.takeoffs = 0;
+    // Band mode is a UI mode, not body state, so it survives a neural reset.
+    this.band = Boolean(this.band);
+  }
+  /** Band mode holds the body in place; pad presses come from the raw rates instead. */
+  setBand(on) {
+    this.band = Boolean(on);
   }
   advance(input, dt) {
     if (
-      input.length !== 6 ||
+      input.length !== CHANNELS.length ||
       !Array.from(input).every(Number.isFinite) ||
       !Number.isFinite(dt) ||
       dt <= 0 ||
       dt > 0.05
     )
       throw Error('Invalid neural controller input');
-    for (let i = 0; i < 6; i++)
+    for (let i = 0; i < CHANNELS.length; i++)
       this.rates[i] = relax(this.rates[i], Math.max(0, input[i]), dt, 0.08);
     const [wl, wr, tl, tr, back, escape] = this.rates;
     const walking = Math.max(0, (wl + wr) / 2 - 6),
       reverse = Math.max(0, back - 25);
     const turn = Math.max(0, tl - 15) - Math.max(0, tr - 15);
     const groundSpeed = 8 * Math.tanh(walking / 30) - 4 * Math.tanh(reverse / 90);
-    this.yawRate = relax(this.yawRate, 3.8 * Math.tanh(turn / 45), dt, 0.04);
+    const held = this.band;
+    this.yawRate = relax(this.yawRate, held ? 0 : 3.8 * Math.tanh(turn / 45), dt, 0.04);
     this.cooldown = Math.max(0, this.cooldown - dt);
     if (this.mode === 'ground' && escape < 45) this.escapeArmed = true;
-    if (this.mode === 'ground' && escape > 100 && this.cooldown === 0 && this.escapeArmed) {
+    if (
+      !this.band &&
+      this.mode === 'ground' &&
+      escape > 100 &&
+      this.cooldown === 0 &&
+      this.escapeArmed
+    ) {
       this.mode = 'escape';
       this.escapeAge = 0;
       this.quietTime = 0;
@@ -106,7 +120,7 @@ export class FlyController {
           break;
         }
       }
-    } else this.velocity = relax(this.velocity, groundSpeed, dt, 0.055);
+    } else this.velocity = relax(this.velocity, held ? 0 : groundSpeed, dt, 0.055);
     this.flightBlend = clamp(this.y / 0.65, 0, 1);
     this.launch = this.mode === 'escape' ? clamp(1 - this.escapeAge / 0.06, 0, 1) : 0;
     this.landing = this.mode === 'landing' ? clamp(this.landingAge / 0.08, 0, 1) : 0;
@@ -126,9 +140,11 @@ export class FlyController {
       dt,
       0.05,
     );
-    this.yaw += this.yawRate * dt;
-    this.x += Math.sin(this.yaw) * this.velocity * dt;
-    this.z += Math.cos(this.yaw) * this.velocity * dt;
+    if (!held) {
+      this.yaw += this.yawRate * dt;
+      this.x += Math.sin(this.yaw) * this.velocity * dt;
+      this.z += Math.cos(this.yaw) * this.velocity * dt;
+    }
     const gaitSpeed = Math.abs(this.velocity) + Math.abs(this.yawRate) * 0.5;
     this.phase += (gaitSpeed > 0.06 ? Math.min(14, gaitSpeed / 1.4) * Math.PI * 2 : 0) * dt;
     this.distance += Math.abs(this.velocity) * dt;

@@ -1,6 +1,7 @@
 import { neutralPoseRad, segmentTransforms } from './body/fk.js';
 import { wingPose } from './wings.js';
 export const LEGS = ['lf', 'lm', 'lh', 'rf', 'rm', 'rh'];
+const lerp3 = (a, b, t) => a.map((v, k) => v + (b[k] - v) * t);
 /** Damped Jacobian IK with a standing-posture constraint. */
 export class Gait {
   constructor(model) {
@@ -131,11 +132,14 @@ export class Gait {
       const lift = Math.sin(swing * Math.PI) * 0.35 * Math.min(1, speed / 0.2);
       const flight = Math.max(0, Math.min(1, state.flightBlend || 0));
       const tuck = flight * (1 - 0.8 * (state.landing || 0));
-      const target = [
+      let target = [
         leg.neutral[0] + x * (1 - flight) - 0.12 * tuck,
         leg.neutral[1] * (1 - 0.18 * tuck),
         0.11 + lift * (1 - flight) + 0.48 * tuck,
       ];
+      const band = Math.max(0, Math.min(1, state.bandWeight || 0));
+      const play = state.bandFeet?.[side > 0 ? 0 : 1];
+      if (band > 0 && play && leg.name.endsWith('f')) target = lerp3(target, play, band);
       this.errors.push(this.solve(leg, target));
       this.targets.push(target);
     }

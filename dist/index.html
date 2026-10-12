@@ -16,8 +16,8 @@
       type="font/woff2"
       crossorigin
     />
-    <script type="module" crossorigin src="./assets/index-CQRKHMtv.js"></script>
-    <link rel="stylesheet" crossorigin href="./assets/index-Do_54AWi.css">
+    <script type="module" crossorigin src="./assets/index-DpSC93pR.js"></script>
+    <link rel="stylesheet" crossorigin href="./assets/index-C6hZVvWQ.css">
   </head>
   <body>
     <svg class="icon-definitions" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
@@ -61,6 +61,14 @@
           <path d="m14 3 7 7-7 7m7-7h-9c-6 0-9 3-9 10" />
         </symbol>
         <symbol id="i-escape" viewBox="0 0 24 24"><path d="m14 2-10 12h7l-1 8 10-13h-7Z" /></symbol>
+        <symbol id="i-music" viewBox="0 0 24 24">
+          <path d="M9 18V5l12-2v13" />
+          <circle cx="6" cy="18" r="3" />
+          <circle cx="18" cy="16" r="3" />
+        </symbol>
+        <symbol id="i-upload" viewBox="0 0 24 24">
+          <path d="M12 15V3m-5 4 5-5 5 5M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" />
+        </symbol>
         <symbol id="i-pause" viewBox="0 0 24 24">
           <rect x="6" y="3" width="3" height="18" rx="1" />
           <rect x="15" y="3" width="3" height="18" rx="1" />
@@ -134,7 +142,7 @@
           </div>
           <div class="actions">
             <span class="field-label">Actions</span>
-            <div class="examples" aria-label="Actions">
+            <div class="examples" aria-label="Actions" role="group">
               <button data-preset="walk" aria-pressed="false">
                 <svg class="icon"><use href="#i-walk" /></svg><span>Walk</span>
               </button>
@@ -146,6 +154,9 @@
               </button>
               <button data-preset="escape" aria-pressed="false">
                 <svg class="icon"><use href="#i-escape" /></svg><span>Fly</span>
+              </button>
+              <button id="music-button" aria-pressed="false">
+                <svg class="icon"><use href="#i-music" /></svg><span>Band</span>
               </button>
             </div>
           </div>
@@ -312,6 +323,73 @@
           ><a href="./model.json" target="_blank">Model parameters ↗</a>
         </div>
       </details>
+    </dialog>
+    <dialog id="music-dialog" aria-labelledby="music-heading">
+      <div class="dialog-heading">
+        <h2 id="music-heading">Band</h2>
+        <button id="close-music" aria-label="Close band">×</button>
+      </div>
+      <p class="music-intro">
+        Paste the song’s YouTube link for the TV, then upload the same song as an audio file. The
+        song is split into bass, body, vocals and highs; each layer stimulates neurons that reach
+        its pad, and only the layers the fly actually presses are heard.
+      </p>
+      <div class="yt-row">
+        <input
+          id="yt-url"
+          type="url"
+          placeholder="https://www.youtube.com/watch?v=…"
+          autocomplete="off"
+          spellcheck="false"
+        />
+        <button id="yt-load" class="tool-button" type="button">Load</button>
+      </div>
+      <p class="yt-status" id="yt-status" hidden></p>
+      <label class="drop-zone" id="drop-zone">
+        <svg class="icon upload-icon"><use href="#i-upload" /></svg>
+        <span class="drop-label" id="drop-label">Drop an audio file or click to browse</span>
+        <input type="file" id="music-file" accept="audio/*" hidden />
+      </label>
+      <div class="track-info" id="track-info" hidden>
+        <span id="track-name"></span>
+      </div>
+      <div class="music-controls" id="music-controls" hidden>
+        <span class="music-time">Start at</span>
+        <input
+          type="range"
+          id="music-seek"
+          min="0"
+          max="100"
+          value="0"
+          step="0.1"
+          aria-label="Start position"
+        />
+        <span id="music-time" class="music-time">0:00</span>
+      </div>
+      <section class="band-panel" id="band-panel" aria-label="Band" hidden>
+        <p id="band-status" class="learn-meta">Load a song to begin.</p>
+        <progress id="band-progress" class="band-progress" max="1" value="0" hidden></progress>
+        <canvas
+          id="band-roll"
+          class="band-roll"
+          role="img"
+          aria-label="The song's layers around the playhead, and which pads the fly pressed"
+        ></canvas>
+        <div class="band-actions">
+          <button id="band-play" class="tool-button" type="button">Play</button>
+          <div class="band-listen" role="group" aria-label="Listen to">
+            <button class="tool-button" data-listen="fly" aria-pressed="true" type="button">
+              Fly
+            </button>
+            <button class="tool-button" data-listen="original" aria-pressed="false" type="button">
+              Original
+            </button>
+          </div>
+          <span class="band-score" title="50% is what guessing scores">
+            Match <strong id="band-score">–</strong>
+          </span>
+        </div>
+      </section>
     </dialog>
   </body>
 </html>
